@@ -112,3 +112,28 @@ def test_s0_database_is_migrated_without_losing_rows(tmp_path):
         (2, "VALID"),
     ]
     upgraded.close()
+
+
+def test_s2a_tables_and_migration_row(conn):
+    tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert {"sec_filing", "sec_filing_document", "filing_party", "cik_map",
+            "source_checkpoint"} <= tables
+    mids = {r["migration_id"] for r in conn.execute(
+        "SELECT migration_id FROM schema_migration")}
+    assert "s2a_us_tables" in mids
+
+
+def test_s2a_migration_preserves_existing_data(tmp_path):
+    from investment_tool.db import connect
+
+    c1 = connect(tmp_path)
+    c1.execute(
+        "INSERT INTO company(company_id, created_asof) VALUES('CN:X','2026-01-01T00:00:00Z')"
+    )
+    c1.commit()
+    c1.close()
+    c2 = connect(tmp_path)  # reopen -> migrations rerun idempotently
+    assert c2.execute("SELECT COUNT(*) FROM company").fetchone()[0] == 1
+    assert c2.execute("SELECT COUNT(*) FROM sec_filing").fetchone()[0] == 0
+    c2.close()

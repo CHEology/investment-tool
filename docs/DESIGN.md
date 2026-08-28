@@ -133,3 +133,42 @@ port; D3, D4, archive mv) -> S3 Lane B -> S4 research protocol (D1) ->
 S5 monitoring/validation soak. Dashboards/VPS deferred. Frozen cards + PIT
 snapshots ship in S1 so the forward-validation clock starts at first
 publication.
+
+## S2a — US information spine (implemented 2026-08-28; corrected design)
+
+Channels (probe-verified): the daily master index is the EVENING completeness
+artifact (it does not exist intraday); getcurrent ATOM is a lossy best-effort
+freshness layer (pagination demonstrably unstable); efts supplies 8-K item
+codes; submissions JSON supplies second-precision acceptance times. Audits
+carry us_completeness = PENDING_EVENING_INDEX | COMPLETE(date).
+
+Identity & limits: live SEC access requires SEC_USER_AGENT (env or Keychain
+'investment-tool-sec-ua'; placeholders refused; never persisted anywhere).
+One process-global token bucket at 4 req/s (burst 8) under SEC's published
+10 req/s. Conditional GETs where honored.
+
+Routing (classification us_v1, queue-safe): 8-K items 4.02/1.03/3.01, NT
+10-K/10-Q, Form 25, and regulatory halt codes -> HARD_NEGATIVE events;
+content-dependent 8-K items, SC 13D, news-pending halts -> review events
+(aging to ARCHIVED_UNREVIEWED per config v0.2 operational keys); 6-K and
+periodic reports -> observations; Forms 3/4/5, 13G, DEF 14A, registrations ->
+reference. Detection is separated from interpretation; no sign is inferred
+without content except the adverse-on-face set.
+
+Evidence: independence derived from filing-party role (ISSUER 0, INSIDER 1,
+third-party FILER about SUBJECT 2, exchange/regulator 3; unresolved roles
+floor at 0 with PARTY_ROLES_UNRESOLVED noted). A halt verifies only that the
+halt occurred. Amendments link only on unique (cik, base form, report_period)
+(LINKED_UNIQUE -> original AMENDED_BY + evidence SUPERSEDED; else AMBIGUOUS/
+UNLINKED). Removals are two-step: index absence -> REMOVAL_SUSPECTED; only a
+confirmed 404/410 direct fetch -> REMOVED + evidence WITHDRAWN.
+
+cik_map is temporally versioned (validity intervals; PIT resolution; history
+never rewritten); reconciliation against the Nasdaq-file universe uses
+explicit states and refuses conflicted mappings before lookup. Lookahead
+protection keys on first_seen_at_utc end-to-end.
+
+Live gate (PR-7, pending): real SEC_USER_AGENT from the user; then us-map
+live sync, daily us-sync (evening ET), halts polling, weekly full-index
+reconciliation, and a 5-calendar-day soak covering >=3 filing days including
+one amendment case and a crash-recovery drill.

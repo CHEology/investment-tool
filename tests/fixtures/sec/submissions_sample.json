@@ -1,0 +1,12 @@
+{"cik": "1000001", "name": "ALPHA TEST CORP",
+ "tickers": ["ALPH"], "exchanges": ["Nasdaq"],
+ "filings": {"recent": {
+   "accessionNumber": ["0001000001-26-000103", "0001000001-26-000102", "0001000001-26-000101"],
+   "form": ["8-K/A", "8-K", "8-K"],
+   "filingDate": ["2026-08-27", "2026-08-27", "2026-08-27"],
+   "reportDate": ["2026-08-20", "2026-08-25", "2026-08-20"],
+   "acceptanceDateTime": ["2026-08-27T20:31:00.000Z", "2026-08-27T18:02:11.000Z",
+                          "2026-08-27T12:15:09.000Z"],
+   "items": ["4.02,9.01", "2.02,9.01", "4.02,9.01"],
+   "primaryDocument": ["alpha-8ka.htm", "alpha-8k2.htm", "alpha-8k1.htm"]
+ }}}

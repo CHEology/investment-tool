@@ -1,0 +1,10 @@
+{"fields": ["cik", "name", "ticker", "exchange"],
+ "data": [
+   [1000001, "ALPHA TEST CORP", "ALPH", "Nasdaq"],
+   [1000010, "MULTICLASS MEDIA", "MCM", "Nasdaq"],
+   [1000010, "MULTICLASS MEDIA", "MCM.A", "Nasdaq"],
+   [1000011, "CONFLICT ONE CORP", "DUPE", "NYSE"],
+   [1000012, "CONFLICT TWO CORP", "DUPE", "Nasdaq"],
+   [1000013, "OTC ONLY LLC", "OTCX", null],
+   [1000002, "BETA PHARMA INC", "BETA", "NYSE"]
+ ]}

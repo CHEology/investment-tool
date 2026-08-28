@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:ndaq="http://www.nasdaqtrader.com/" version="2.0">
+<channel><title>Trading Halts</title>
+<item><ndaq:HaltDate>08/27/2026</ndaq:HaltDate><ndaq:HaltTime>10:01:11</ndaq:HaltTime>
+<ndaq:IssueSymbol>ALPH</ndaq:IssueSymbol><ndaq:IssueName>Alpha Test Corp</ndaq:IssueName>
+<ndaq:Market>NASDAQ</ndaq:Market><ndaq:ReasonCode>T12</ndaq:ReasonCode>
+<ndaq:ResumptionTradeTime></ndaq:ResumptionTradeTime></item>
+<item><ndaq:HaltDate>08/27/2026</ndaq:HaltDate><ndaq:HaltTime>11:22:00</ndaq:HaltTime>
+<ndaq:IssueSymbol>BETA</ndaq:IssueSymbol><ndaq:IssueName>Beta Pharma</ndaq:IssueName>
+<ndaq:Market>NYSE</ndaq:Market><ndaq:ReasonCode>H10</ndaq:ReasonCode>
+<ndaq:ResumptionTradeTime></ndaq:ResumptionTradeTime></item>
+<item><ndaq:HaltDate>08/27/2026</ndaq:HaltDate><ndaq:HaltTime>09:45:03</ndaq:HaltTime>
+<ndaq:IssueSymbol>GAMM</ndaq:IssueSymbol><ndaq:IssueName>Gamma Corp</ndaq:IssueName>
+<ndaq:Market>NASDAQ</ndaq:Market><ndaq:ReasonCode>LUDP</ndaq:ReasonCode>
+<ndaq:ResumptionTradeTime>09:50:03</ndaq:ResumptionTradeTime></item>
+</channel></rss>
