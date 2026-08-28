@@ -161,6 +161,7 @@ def run_us_sync(conn, cfg, date: str, index_fixture: str | None,
         _live_submissions_enrichment(conn, cfg, http, date, submissions_cap, audit)
 
     audit["routing"] = us_route.route_unclassified(conn)
+    audit["propagation"] = us_route.propagate_enrichment(conn)
     audit["amendments"] = us_route.link_amendments(conn)
     conn.execute(
         "UPDATE sec_filing SET review_state='PENDING' WHERE review_state IS NULL"

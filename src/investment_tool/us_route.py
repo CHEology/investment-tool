@@ -121,9 +121,10 @@ def route_unclassified(conn: sqlite3.Connection) -> dict:
 
 def _create_event(conn, filing: sqlite3.Row, event_type: str, relevance: str) -> str:
     event_id = _event_id(filing["accession"], event_type)
-    published = filing["accepted_at_utc"] or (
-        f"{filing['filing_date']}T00:00:00Z" if filing["filing_date"] else None
-    )
+    # Publication time is the SEC acceptance time or nothing. A filing DATE is
+    # date-precision information (kept on sec_filing); it is never dressed up
+    # as a midnight timestamp. first_seen governs replay either way.
+    published = filing["accepted_at_utc"]
     conn.execute(
         "INSERT OR IGNORE INTO event(event_id, scope, type, published_at_utc,"
         " first_seen_at_utc, state, lane_relevance)"
@@ -178,7 +179,8 @@ def link_amendments(conn: sqlite3.Connection) -> dict:
     Anything else is AMBIGUOUS or UNLINKED — never guessed."""
     hist = {"LINKED_UNIQUE": 0, "AMBIGUOUS": 0, "UNLINKED": 0}
     rows = conn.execute(
-        "SELECT * FROM sec_filing WHERE is_amendment=1 AND amend_link_state IS NULL"
+        "SELECT * FROM sec_filing WHERE is_amendment=1"
+        " AND (amend_link_state IS NULL OR amend_link_state='UNLINKED')"
     ).fetchall()
     for a in rows:
         base = a["form"][:-2]
@@ -250,3 +252,85 @@ def eligible_session_us(accepted_at_utc: str | None, filing_date: str | None) ->
                 "same_session_partial": None, "session_calendar": calendar_note}
     return {"eligible_from_date": None, "precision": "UNKNOWN",
             "same_session_partial": None, "session_calendar": calendar_note}
+
+
+def propagate_enrichment(conn: sqlite3.Connection) -> dict:
+    """Late-arriving enrichment must reach derived records (idempotent):
+    - acceptance times update linked event/evidence publication timestamps;
+    - fabricated legacy midnight timestamps are cleared when no acceptance
+      time exists (honest NULL rather than false precision);
+    - STAKE_ACTIVIST events gain their subject-company link (and corrected
+      evidence independence) when party roles become resolvable;
+    - issuer events gain company links when a CIK later resolves via us-map.
+    """
+    out = {"timestamps_updated": 0, "midnight_cleared": 0,
+           "subjects_resolved": 0, "issuer_links_added": 0}
+
+    for f in conn.execute(
+        "SELECT f.accession, f.event_id, f.accepted_at_utc FROM sec_filing f"
+        " JOIN event e ON e.event_id=f.event_id"
+        " WHERE f.accepted_at_utc IS NOT NULL"
+        " AND (e.published_at_utc IS NULL OR e.published_at_utc != f.accepted_at_utc)"
+    ).fetchall():
+        conn.execute("UPDATE event SET published_at_utc=? WHERE event_id=?",
+                     (f["accepted_at_utc"], f["event_id"]))
+        conn.execute("UPDATE evidence SET published_at_utc=? WHERE evidence_id=?",
+                     (f["accepted_at_utc"], "evd_us_" + f["accession"]))
+        out["timestamps_updated"] += 1
+
+    for f in conn.execute(
+        "SELECT f.accession, f.event_id FROM sec_filing f"
+        " JOIN event e ON e.event_id=f.event_id"
+        " WHERE f.accepted_at_utc IS NULL AND e.published_at_utc LIKE '%T00:00:00Z'"
+    ).fetchall():
+        conn.execute("UPDATE event SET published_at_utc=NULL WHERE event_id=?",
+                     (f["event_id"],))
+        conn.execute("UPDATE evidence SET published_at_utc=NULL WHERE evidence_id=?",
+                     ("evd_us_" + f["accession"],))
+        out["midnight_cleared"] += 1
+
+    for f in conn.execute(
+        "SELECT f.* FROM sec_filing f JOIN event e ON e.event_id=f.event_id"
+        " WHERE e.type='STAKE_ACTIVIST' AND NOT EXISTS"
+        " (SELECT 1 FROM event_company ec WHERE ec.event_id=e.event_id)"
+    ).fetchall():
+        subject_cik = resolve_subject_roles(conn, f["accession"])
+        if subject_cik is None:
+            continue
+        company = conn.execute(
+            "SELECT c.company_id FROM company c JOIN listing l ON l.company_id=c.company_id"
+            " WHERE c.cik=? ORDER BY c.company_id LIMIT 1", (subject_cik,),
+        ).fetchone()
+        if company is None:
+            continue
+        conn.execute("INSERT OR IGNORE INTO event_company(event_id, company_id) VALUES(?,?)",
+                     (f["event_id"], company["company_id"]))
+        roles = {r["role"] for r in conn.execute(
+            "SELECT role FROM filing_party WHERE accession=?", (f["accession"],))}
+        indep, note = _independence(roles, True)
+        conn.execute(
+            "UPDATE evidence SET dims_json=json_set(dims_json,'$.independence',?),"
+            " excerpt=? WHERE evidence_id=?",
+            (indep, f"{f['form']} items={f['items_csv'] or '?'} ({note})",
+             "evd_us_" + f["accession"]),
+        )
+        out["subjects_resolved"] += 1
+
+    for f in conn.execute(
+        "SELECT f.accession, f.event_id, f.cik FROM sec_filing f"
+        " JOIN event e ON e.event_id=f.event_id"
+        " WHERE e.type != 'STAKE_ACTIVIST' AND NOT EXISTS"
+        " (SELECT 1 FROM event_company ec WHERE ec.event_id=e.event_id)"
+    ).fetchall():
+        company = conn.execute(
+            "SELECT c.company_id FROM company c JOIN listing l ON l.company_id=c.company_id"
+            " WHERE c.cik=? ORDER BY c.company_id LIMIT 1", (f["cik"],),
+        ).fetchone()
+        if company:
+            conn.execute(
+                "INSERT OR IGNORE INTO event_company(event_id, company_id) VALUES(?,?)",
+                (f["event_id"], company["company_id"]))
+            out["issuer_links_added"] += 1
+
+    conn.commit()
+    return out

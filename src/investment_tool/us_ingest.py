@@ -69,10 +69,12 @@ def ingest_daily_index(conn: sqlite3.Connection, payload: bytes, index_date: str
         conn.execute(
             "INSERT INTO source_checkpoint(source_id, cursor, updated_at_utc)"
             " VALUES('sec_daily_index', ?, ?)"
-            " ON CONFLICT(source_id) DO UPDATE SET cursor=excluded.cursor,"
-            " updated_at_utc=excluded.updated_at_utc",
+            " ON CONFLICT(source_id) DO UPDATE SET"
+            "  cursor=CASE WHEN excluded.cursor > source_checkpoint.cursor"
+            "         THEN excluded.cursor ELSE source_checkpoint.cursor END,"
+            "  updated_at_utc=excluded.updated_at_utc",
             (index_date, seen),
-        )
+        )  # monotonic: an older backfill day never moves the latest cursor back
         conn.commit()
     except Exception:
         conn.rollback()
