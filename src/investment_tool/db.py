@@ -257,7 +257,8 @@ CREATE TABLE IF NOT EXISTS sec_filing(
   event_id TEXT,
   supersession_state TEXT NOT NULL DEFAULT 'ACTIVE',
   quality TEXT NOT NULL,
-  manifest_id TEXT NOT NULL
+  manifest_id TEXT NOT NULL,
+  review_state TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_secfiling_cik ON sec_filing(cik, form, filing_date);
 CREATE INDEX IF NOT EXISTS idx_secfiling_seen ON sec_filing(first_seen_at_utc);
@@ -316,6 +317,9 @@ ADDITIVE_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "frozen_artifact": (
         ("status", "TEXT NOT NULL DEFAULT 'VALID'"),
         ("status_note", "TEXT"),
+    ),
+    "sec_filing": (
+        ("review_state", "TEXT"),
     ),
 }
 

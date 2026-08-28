@@ -14,10 +14,10 @@ from investment_tool.quality import Quality, QualityState
 
 
 def _cfg(conn):
-    cfg = config_mod.load("v0.1")
+    cfg = config_mod.load("v0.2")
     config_mod.register(
         conn, cfg,
-        changelog="v0.1: telemetry-only additions; admission thresholds identical to v0",
+        changelog="v0.2: operational keys only; thresholds identical to v0.1/v0",
     )
     return cfg
 
@@ -360,6 +360,84 @@ def cmd_daily(args) -> int:
     return 2 if degraded else 0
 
 
+def cmd_us_map(args) -> int:
+    import json as json_mod
+
+    from investment_tool import us_cli
+
+    conn = connect()
+    cfg = _cfg(conn)
+    audit = us_cli.run_us_map(conn, cfg, args.fixture)
+    print(json_mod.dumps(audit, ensure_ascii=False, indent=2, default=str))
+    return 0 if "error" not in audit else 2
+
+
+def cmd_us_sync(args) -> int:
+    import json as json_mod
+
+    from investment_tool import us_cli
+
+    conn = connect()
+    cfg = _cfg(conn)
+    audit = us_cli.run_us_sync(conn, cfg, args.date, args.index_fixture, args.efts_fixture,
+                               args.submissions_fixture or [], args.getcurrent_fixture)
+    print(json_mod.dumps(audit, ensure_ascii=False, indent=2, default=str))
+    degraded = any(isinstance(v, dict) and "error" in v
+                   for v in audit.get("channels", {}).values())
+    return 2 if degraded else 0
+
+
+def cmd_halts(args) -> int:
+    import json as json_mod
+    from pathlib import Path
+
+    from investment_tool.lineage import record_fetch
+    from investment_tool.providers import nasdaq_halts
+    from investment_tool.quality import Quality, QualityState
+
+    conn = connect()
+    cfg = _cfg(conn)
+    if args.fixture:
+        payload = Path(args.fixture).read_bytes()
+    else:
+        http = nasdaq_halts.client()
+        resp = http.get(nasdaq_halts.HALTS_URL)
+        quality = Quality(QualityState.OK if resp.status_code == 200 else QualityState.ERROR,
+                          f"http={resp.status_code}")
+        record_fetch(conn, provider="nasdaq_trader", dataset="trade_halts", params={},
+                     source_url=nasdaq_halts.HALTS_URL, payload=resp.content,
+                     http_status=resp.status_code, quality=quality, config_version=cfg.id)
+        if resp.status_code != 200:
+            print(f"halts fetch failed http={resp.status_code}")
+            return 2
+        payload = resp.content
+    hist = nasdaq_halts.route_halts(conn, nasdaq_halts.parse_halts(payload))
+    print(json_mod.dumps(hist, indent=2))
+    return 0
+
+
+def cmd_review(args) -> int:
+    import json as json_mod
+
+    from investment_tool import us_cli
+
+    conn = connect()
+    cfg = _cfg(conn)
+    print(json_mod.dumps(us_cli.run_review(conn, cfg), ensure_ascii=False, indent=2,
+                         default=str))
+    return 0
+
+
+def cmd_export(args) -> int:
+    from investment_tool import us_cli
+
+    conn = connect()
+    _cfg(conn)
+    path = us_cli.run_export(conn, args.candidate)
+    print(f"exported: {path}")
+    return 0
+
+
 def cmd_status(args) -> int:
     conn = connect()
     for table in ("company", "listing", "manifest", "security_day", "announcement",
@@ -426,6 +504,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dy.add_argument("--market", choices=["a"], default="a")
     dy.set_defaults(func=cmd_daily)
+
+    um = sub.add_parser("us-map", help="sync SEC CIK/ticker map + reconcile vs universe")
+    um.add_argument("--fixture", default=None, help="offline tickers-exchange JSON path")
+    um.set_defaults(func=cmd_us_map)
+
+    us = sub.add_parser("us-sync", help="US filing discovery -> normalize -> route (audited)")
+    us.add_argument("--date", required=True)
+    us.add_argument("--index-fixture", default=None)
+    us.add_argument("--efts-fixture", default=None)
+    us.add_argument("--submissions-fixture", action="append", default=None)
+    us.add_argument("--getcurrent-fixture", default=None)
+    us.set_defaults(func=cmd_us_sync)
+
+    ha = sub.add_parser("halts", help="poll Nasdaq trade-halts RSS (observation/event routing)")
+    ha.add_argument("--fixture", default=None)
+    ha.set_defaults(func=cmd_halts)
+
+    rv = sub.add_parser("review", help="operator review queue (US filings + A-share candidates)")
+    rv.set_defaults(func=cmd_review)
+
+    ex = sub.add_parser("export", help="export a candidate bundle (external-agent boundary)")
+    ex.add_argument("--candidate", required=True)
+    ex.set_defaults(func=cmd_export)
 
     st = sub.add_parser("status", help="table counts and manifest quality summary")
     st.set_defaults(func=cmd_status)
