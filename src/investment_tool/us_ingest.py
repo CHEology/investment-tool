@@ -181,6 +181,17 @@ def confirm_removal(conn: sqlite3.Connection, accession: str, http_status: int) 
     """Two-step removal: absence alone is never proof. 404/410 on the direct
     accession fetch confirms; anything else restores ACTIVE with an anomaly
     observation."""
+    prior = conn.execute(
+        "SELECT supersession_state FROM sec_filing WHERE accession=?", (accession,)
+    ).fetchone()
+    if http_status in (404, 410) and prior and prior["supersession_state"] != "REMOVAL_SUSPECTED":
+        # a lone 404 with no index-absence corroboration only raises suspicion
+        conn.execute(
+            "UPDATE sec_filing SET supersession_state='REMOVAL_SUSPECTED' WHERE accession=?",
+            (accession,),
+        )
+        conn.commit()
+        return "REMOVAL_SUSPECTED"
     if http_status in (404, 410):
         conn.execute(
             "UPDATE sec_filing SET supersession_state='REMOVED' WHERE accession=?", (accession,)

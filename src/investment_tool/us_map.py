@@ -40,9 +40,19 @@ def sync_cik_map(conn: sqlite3.Connection, rows: list[dict], asof_date: str,
         for r in conn.execute("SELECT * FROM cik_map WHERE valid_to_date IS NULL")
     }
     opened = closed = unchanged = 0
+    stale_marked = stale_recovered = 0
     for key, r in incoming.items():
         state = state_for(r)
         cur = open_rows.get(key)
+        if cur is not None and cur["stale_since_date"] is not None:
+            # reappearance clears a transient-absence suspicion without closing
+            conn.execute(
+                "UPDATE cik_map SET stale_since_date=NULL, state=? WHERE cik=? AND ticker=?"
+                " AND valid_from_date=?",
+                (state, cur["cik"], cur["ticker"], cur["valid_from_date"]),
+            )
+            stale_recovered += 1
+            continue
         if cur is not None and (cur["exchange"], cur["name"], cur["state"]) == (
             r["exchange"], r["name"], state
         ):
@@ -57,12 +67,26 @@ def sync_cik_map(conn: sqlite3.Connection, rows: list[dict], asof_date: str,
             closed += 1
         conn.execute(
             "INSERT OR REPLACE INTO cik_map(cik, ticker, exchange, name, state, source,"
-            " valid_from_date, valid_to_date) VALUES(?,?,?,?,?,?,?,NULL)",
+            " valid_from_date, valid_to_date, stale_since_date)"
+            " VALUES(?,?,?,?,?,?,?,NULL,NULL)",
             (r["cik"], r["ticker"], r["exchange"], r["name"], state, source, asof_date),
         )
         opened += 1
     for key, cur in open_rows.items():
-        if key not in incoming:
+        if key in incoming:
+            continue
+        # Two-strike absence: a single disappearance from the SEC file marks
+        # the mapping STALE_SUSPECTED (interval stays open); only a SECOND
+        # sync on a later date with the row still absent closes it. A
+        # transient source glitch is never treated as a confirmed delisting.
+        if cur["stale_since_date"] is None:
+            conn.execute(
+                "UPDATE cik_map SET stale_since_date=?, state='STALE_SUSPECTED'"
+                " WHERE cik=? AND ticker=? AND valid_from_date=?",
+                (asof_date, cur["cik"], cur["ticker"], cur["valid_from_date"]),
+            )
+            stale_marked += 1
+        elif cur["stale_since_date"] < asof_date:
             conn.execute(
                 "UPDATE cik_map SET valid_to_date=? WHERE cik=? AND ticker=?"
                 " AND valid_from_date=?",
@@ -70,7 +94,9 @@ def sync_cik_map(conn: sqlite3.Connection, rows: list[dict], asof_date: str,
             )
             closed += 1
     conn.commit()
-    return {"opened": opened, "closed": closed, "unchanged": unchanged, "incoming": len(incoming)}
+    return {"opened": opened, "closed": closed, "unchanged": unchanged,
+            "stale_marked": stale_marked, "stale_recovered": stale_recovered,
+            "incoming": len(incoming)}
 
 
 def cik_for(conn: sqlite3.Connection, ticker: str, asof: str) -> list[sqlite3.Row]:

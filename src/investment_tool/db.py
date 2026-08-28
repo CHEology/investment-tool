@@ -287,6 +287,7 @@ CREATE TABLE IF NOT EXISTS cik_map(
   source TEXT NOT NULL,
   valid_from_date TEXT NOT NULL,
   valid_to_date TEXT,
+  stale_since_date TEXT,
   PRIMARY KEY(cik, ticker, valid_from_date)
 );
 CREATE TABLE IF NOT EXISTS source_checkpoint(
@@ -320,6 +321,9 @@ ADDITIVE_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "sec_filing": (
         ("review_state", "TEXT"),
+    ),
+    "cik_map": (
+        ("stale_since_date", "TEXT"),
     ),
 }
 

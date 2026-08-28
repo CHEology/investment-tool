@@ -38,11 +38,12 @@ def test_versioning_never_rewrites_history(conn):
     # PIT resolution
     assert cik_for(conn, "ALPH", "2026-08-10")[0]["exchange"] == "Nasdaq"
     assert cik_for(conn, "ALPH", "2026-08-25")[0]["exchange"] == "NYSE"
-    # disappearance closes the interval
+    # first disappearance only SUSPECTS (two-strike; closure tested separately)
     gone = [r for r in moved if r["ticker"] != "OTCX"]
     sync_cik_map(conn, gone, "2026-08-28", "sec")
-    otcx = conn.execute("SELECT valid_to_date FROM cik_map WHERE ticker='OTCX'").fetchone()
-    assert otcx["valid_to_date"] == "2026-08-28"
+    otcx = conn.execute("SELECT valid_to_date, state FROM cik_map"
+                        " WHERE ticker='OTCX'").fetchone()
+    assert otcx["valid_to_date"] is None and otcx["state"] == "STALE_SUSPECTED"
 
 
 def _seed_universe(conn):
@@ -100,3 +101,39 @@ def test_rate_limiter_paces_without_wall_clock():
         lim.acquire()
     # 2 burst tokens free, then 4/s pacing -> total sleep ~= 1.0s for 4 more
     assert abs(sum(sleeps) - 1.0) < 0.05
+
+
+def test_transient_disappearance_never_closes_interval(conn):
+    rows = _rows()
+    sync_cik_map(conn, rows, "2026-08-01", "sec")
+    without_beta = [r for r in rows if r["ticker"] != "BETA"]
+    r2 = sync_cik_map(conn, without_beta, "2026-08-02", "sec")
+    assert r2["stale_marked"] == 1
+    beta = conn.execute("SELECT * FROM cik_map WHERE ticker='BETA'").fetchone()
+    assert beta["valid_to_date"] is None and beta["state"] == "STALE_SUSPECTED"
+    # reappears -> suspicion cleared, interval still open, no history rewrite
+    r3 = sync_cik_map(conn, rows, "2026-08-03", "sec")
+    assert r3["stale_recovered"] == 1
+    beta = conn.execute("SELECT * FROM cik_map WHERE ticker='BETA'").fetchone()
+    assert beta["valid_to_date"] is None and beta["state"] == "OK"
+    assert conn.execute("SELECT COUNT(*) FROM cik_map WHERE ticker='BETA'").fetchone()[0] == 1
+
+
+def test_two_strike_absence_closes_and_ticker_reuse_reopens(conn):
+    rows = _rows()
+    sync_cik_map(conn, rows, "2026-08-01", "sec")
+    without_beta = [r for r in rows if r["ticker"] != "BETA"]
+    sync_cik_map(conn, without_beta, "2026-08-02", "sec")   # strike 1: suspected
+    sync_cik_map(conn, without_beta, "2026-08-05", "sec")   # strike 2: closed
+    beta = conn.execute("SELECT * FROM cik_map WHERE ticker='BETA'"
+                        " ORDER BY valid_from_date").fetchall()
+    assert len(beta) == 1 and beta[0]["valid_to_date"] == "2026-08-05"
+    # ticker reused later by a DIFFERENT cik -> new open interval, old preserved
+    reused = without_beta + [{"cik": "9999999", "name": "NEW BETA CO",
+                              "ticker": "BETA", "exchange": "NYSE"}]
+    sync_cik_map(conn, reused, "2026-08-10", "sec")
+    beta = conn.execute("SELECT cik, valid_from_date, valid_to_date FROM cik_map"
+                        " WHERE ticker='BETA' ORDER BY valid_from_date").fetchall()
+    assert len(beta) == 2
+    assert beta[0]["valid_to_date"] == "2026-08-05"
+    assert beta[1]["cik"] == "9999999" and beta[1]["valid_to_date"] is None

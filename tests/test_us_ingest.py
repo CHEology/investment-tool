@@ -107,3 +107,17 @@ def test_removal_two_step_requires_confirmation(conn):
     # confirmed gone -> REMOVED
     us_ingest.mark_removal_suspected(conn, [acc])
     assert us_ingest.confirm_removal(conn, acc, 404) == "REMOVED"
+
+
+def test_lone_404_without_suspicion_only_suspects(conn):
+    _ingest(conn)
+    acc = "0001000007-26-000701"
+    # no prior REMOVAL_SUSPECTED: a single 404 must not remove
+    assert us_ingest.confirm_removal(conn, acc, 404) == "REMOVAL_SUSPECTED"
+    st = conn.execute("SELECT supersession_state FROM sec_filing WHERE accession=?",
+                      (acc,)).fetchone()[0]
+    assert st == "REMOVAL_SUSPECTED"
+    # corroborated by the second observation -> REMOVED, record preserved
+    assert us_ingest.confirm_removal(conn, acc, 404) == "REMOVED"
+    assert conn.execute("SELECT COUNT(*) FROM sec_filing WHERE accession=?",
+                        (acc,)).fetchone()[0] == 1
