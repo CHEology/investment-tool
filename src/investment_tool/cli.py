@@ -289,6 +289,77 @@ def cmd_credentials(args) -> int:
     return 0
 
 
+def cmd_validate(args) -> int:
+    import json as json_mod
+
+    from investment_tool import validate as validate_mod
+
+    conn = connect()
+    _cfg(conn)
+    audit = validate_mod.run_validation(conn, args.asof)
+    print(json_mod.dumps(audit, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_daily(args) -> int:
+    """A-share daily operations glue over EXISTING steps only (S1.9V):
+    benchmarks/calendar refresh -> trading-day check -> snapshot -> scan ->
+    backup. Idempotent; degraded steps set exit code 2 and are named."""
+    from datetime import UTC, datetime
+
+    from investment_tool import spine
+    from investment_tool import validate as validate_mod
+
+    conn = connect()
+    cfg = _cfg(conn)
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    status: dict[str, str] = {}
+    degraded = False
+
+    try:
+        bench = spine.ingest_benchmarks(conn, cfg.id, beg=spine.default_beg(45))
+        status["benchmarks"] = str(bench)
+    except Exception as exc:  # noqa: BLE001 - each step degrades independently
+        status["benchmarks"] = f"DEGRADED: {exc}"
+        degraded = True
+
+    trading = conn.execute(
+        "SELECT 1 FROM calendar_day WHERE exchange='SZSE' AND date=? AND is_trading=1",
+        (today,),
+    ).fetchone()
+    if trading is None:
+        status["trading_day"] = "NO (calendar); snapshot/scan skipped"
+    else:
+        try:
+            result = spine.ingest_snapshot(conn, cfg.id, today)
+            status["snapshot"] = str({k: result[k] for k in ("rows", "pages") if k in result})
+            if "error" in result:
+                degraded = True
+        except Exception as exc:  # noqa: BLE001
+            status["snapshot"] = f"DEGRADED: {exc}"
+            degraded = True
+        try:
+            from investment_tool import lane_a
+
+            audit = lane_a.run_scan(conn, cfg, today)
+            status["scan"] = ("error: " + audit["error"]) if "error" in audit else (
+                f"triggers={audit['triggers']} candidates={audit['candidates']}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            status["scan"] = f"DEGRADED: {exc}"
+            degraded = True
+
+    try:
+        status["backup"] = validate_mod.backup_database(conn)
+    except Exception as exc:  # noqa: BLE001
+        status["backup"] = f"DEGRADED: {exc}"
+        degraded = True
+
+    for k, v in status.items():
+        print(f"{k}: {v}")
+    return 2 if degraded else 0
+
+
 def cmd_status(args) -> int:
     conn = connect()
     for table in ("company", "listing", "manifest", "security_day", "announcement",
@@ -345,6 +416,16 @@ def build_parser() -> argparse.ArgumentParser:
     cr = sub.add_parser("credentials", help="store a provider token via hidden input (Keychain)")
     cr.add_argument("provider", choices=["tushare", "eodhd"])
     cr.set_defaults(func=cmd_credentials)
+
+    va = sub.add_parser("validate", help="write forward-validation snapshots (INV-10 ledger)")
+    va.add_argument("--asof", default=None, help="YYYY-MM-DD (default today UTC)")
+    va.set_defaults(func=cmd_validate)
+
+    dy = sub.add_parser(
+        "daily", help="A-share daily glue: benchmarks -> snapshot -> scan -> backup"
+    )
+    dy.add_argument("--market", choices=["a"], default="a")
+    dy.set_defaults(func=cmd_daily)
 
     st = sub.add_parser("status", help="table counts and manifest quality summary")
     st.set_defaults(func=cmd_status)
