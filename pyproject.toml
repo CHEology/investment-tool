@@ -1,16 +1,17 @@
 [project]
 name = "investment-tool"
-version = "0.1.0"
-description = "Portfolio analytics and market data tooling"
+version = "0.2.0"
+description = "Auditable two-lane investment opportunity discovery and research system (A-shares + US)"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "CHEology" }]
 dependencies = [
+    "requests>=2.32",
+    "pyyaml>=6.0",
     "pandas>=2.2",
     "numpy>=1.26",
-    "yfinance>=0.2.40",
-    "pyarrow>=16.0",
+    "keyring>=25.0",
 ]
 
 [project.optional-dependencies]

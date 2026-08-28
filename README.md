@@ -1,10 +1,19 @@
 # investment-tool
 
-Portfolio analytics and market data tooling. Fetches price history, tracks
-holdings, and reports risk/return statistics from the command line or a notebook.
+Auditable, free-first investment opportunity discovery and research system for
+China A-shares (SSE, SZSE, BSE) and U.S.-listed equities.
 
-> Not investment advice. This is a calculation tool — it reports what the numbers
-> did, and makes no recommendation about what to buy, sell, or hold.
+Two opportunity lanes: negative-shock overreaction (Lane A) and verified
+positive step-changes in small/mid caps (Lane B), on a 3-18 month horizon.
+Deterministic screening first; multi-model research only for shortlisted
+candidates; every fetch leaves a manifest with SHA-256 lineage and an explicit
+quality state; every published card/thesis is frozen, versioned, and tracked
+forward. Zero opportunities is a valid daily result.
+
+> Research tooling only. No trading, no broker connectivity, no position
+> sizing, and no investment advice. See docs/INVARIANTS.md.
+
+Design baseline: docs/DESIGN.md (binding). Invariants: docs/INVARIANTS.md.
 
 ## Setup
 
@@ -13,74 +22,45 @@ uv venv --python 3.12
 uv pip install -e ".[dev]"
 ```
 
-Then activate the environment:
+## Operator commands
 
 ```bash
-source .venv/bin/activate
+invest seed --market all   # seed universe from official identifier sources
+invest resolve 300274      # A-share resolution
+invest resolve AAPL        # US resolution
+invest fx                  # ECB USD/CNY reference rate
+invest status              # table counts + manifest quality summary
 ```
 
-Optional API keys go in `.env` (copy `.env.example`). `.env` is gitignored —
-this repository is public, so keep keys and real holdings out of commits.
-
-## Usage
-
-Fetch adjusted close prices:
+Lane A currently uses a free-first, provisional market-data spine. Run the
+daily stages in this order (replace the date with the A-share trading date):
 
 ```bash
-invest prices VOO AAPL --start 2024-01-01
+invest ingest-eod --date 2026-08-28
+invest ingest-benchmarks
+invest backfill --skip-existing       # resumable; exits non-zero after a breaker abort
+invest scan --date 2026-08-28
 ```
 
-Report on a portfolio. Copy `examples/holdings.example.json` somewhere
-gitignored (`data/` works) and edit it:
+`ingest-eod` stores the current Eastmoney snapshot, benchmark history comes
+from Eastmoney, SSE/SZSE adjusted history comes from Tencent qfq, BSE raw
+history comes from Sina, and candidate-driven announcements come from CNInfo.
+All four are manifested; scan-tier price data remains visibly
+`PROVISIONAL`. `--skip-existing` only skips listings that already satisfy the
+configured 180-day history gate, so a partial history is retried.
 
-```bash
-invest report data/holdings.json
-```
+Historical scans are point-in-time bounded: they ignore trigger observations
+and announcements first seen after the requested scan date, and only use
+market snapshots available by that date. Consequently, a newly fetched old
+announcement may be useful for present research but cannot silently change an
+older replay result.
 
-Output covers allocation weights plus total return, CAGR, annualized
-volatility, Sharpe ratio, and max drawdown. Add `--json` for machine-readable
-output.
+Current limitations: the free providers may throttle or change response
+shape; historical market-snapshot coverage is sparse; BSE returns are raw and
+therefore carry corporate-action risk; and search plans are C0 human-runnable,
+not autonomous web-research execution. A zero-candidate result describes the
+covered sample, not the entire market when history coverage is incomplete.
 
-### As a library
-
-```python
-from investment_tool import Portfolio, performance_summary
-from investment_tool.data import fetch_history
-
-portfolio = Portfolio({"VOO": 40, "AAPL": 25}, cash=2500)
-prices = fetch_history(portfolio.tickers, start="2024-01-01")
-performance_summary(portfolio.equity_curve(prices))
-```
-
-## Layout
-
-| Path | What's in it |
-| --- | --- |
-| `src/investment_tool/data.py` | Price fetching (yfinance) with an on-disk parquet cache |
-| `src/investment_tool/portfolio.py` | `Portfolio` holdings model and performance metrics |
-| `src/investment_tool/cli.py` | `invest` command line entry point |
-| `tests/` | pytest suite, runs offline against synthetic prices |
-| `notebooks/` | Exploratory analysis |
-| `data/` | Local price cache and private holdings — gitignored |
-
-## Development
-
-```bash
-pytest
-ruff check .
-```
-
-Prices are cached under `data/prices/` as parquet. Pass `--no-cache` to force a
-refresh.
-
-## Caveats
-
-- `Portfolio` assumes a static share count over the reporting window; it does
-  not yet model contributions, withdrawals, or trades mid-period.
-- Long-only. Short positions are rejected rather than mis-priced.
-- Dividends are handled via yfinance's `auto_adjust`, so returns are total
-  returns, not price returns.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+Secrets live in macOS Keychain or `.env` (gitignored). The public repository
+contains code, schemas, config, and synthetic fixtures only — never market
+data, credentials, or generated research.

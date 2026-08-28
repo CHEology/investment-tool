@@ -1,0 +1,70 @@
+# Threshold registry v0 — EVERY entry is EXPERIMENTAL (unvalidated hypothesis).
+# Governance (DESIGN 5.13/13): forward-only changes via a NEW config id; a change
+# requires >=1 quarter of forward outcome data or an identified structural error;
+# never a single successful anecdote. The replay library is regression-only.
+meta:
+  id: v0.1
+  status: EXPERIMENTAL
+  change_rule: forward-only; new config id per change; changelog mandatory
+  changelog: >-
+    v0.1 (2026-08-28): TELEMETRY-ONLY additions (slow-drawdown shadow thresholds,
+    episode cooldown length). Every candidate-admission threshold is
+    byte-identical to v0. No parameter was tuned toward any classification
+    outcome.
+
+universe:
+  min_history_days:
+    value: 180
+    purpose: exclude names too new for return statistics
+  liquidity_adv60_usd:
+    exclude_below: {value: 500000, purpose: not actionable below this ADV}
+    warn_below: {value: 3000000, purpose: actionable with prominent liquidity warning}
+
+lane_a:
+  trigger:
+    peer_adj_car_0_3_max:
+      value: "-0.10"
+      purpose: dislocation trigger on peer-adjusted CAR over [0,+3]
+      fp_fn: looser floods cause-hunt; tighter misses slow bleeds (shadow log measures FN side)
+    residual_sigma_mult:
+      value: 3.0
+      purpose: scale trigger to the name's own residual volatility
+    shadow_fraction:
+      value: 0.70
+      purpose: near-miss shadow logging band for false-negative calibration
+  research_admission:
+    excess_ratio_min:
+      value: 1.5
+      purpose: "abs(peer-adj dMcap) / damage_high required for EXCESS admission"
+  deterioration_flag_cap:
+    value: 3
+    purpose: flags >= cap => attention capped + adversarial emphasis directive
+  car_windows: {value: [1, 3, 10]}
+  leakage_window: {value: [20, 1]}
+  limit_extension_cap_sessions: {value: 15}
+
+peer_cells:
+  min_peer_count: {value: 8, purpose: below this, fall back to broader cell}
+  limit_contaminated_fraction:
+    value: 0.20
+    purpose: fraction of limit-locked members that taints a cell median
+
+boards:
+  price_limits:
+    MAIN: {value: "0.10"}
+    CHINEXT: {value: "0.20"}
+    STAR: {value: "0.20"}
+    BSE: {value: "0.30"}
+    ST_MAIN: {value: "0.05"}
+
+telemetry:
+  # Observation-only instrumentation. These thresholds CANNOT admit candidates.
+  slow_drawdown_car10:
+    value: -0.15
+    purpose: shadow-log 10-session peer-adjusted drawdowns for recall calibration
+  slow_drawdown_car20:
+    value: -0.20
+    purpose: shadow-log 20-session peer-adjusted drawdowns for recall calibration
+  episode_cooldown_sessions:
+    value: 10
+    purpose: one anchor trigger per listing per window (multiple-testing control)

@@ -18,6 +18,10 @@ data/*
 *.sqlite
 *.db
 cache/
+research/
+*.db
+*.db-wal
+*.db-shm
 
 # --- Python ---
 __pycache__/
@@ -32,8 +36,20 @@ venv/
 
 # --- Tooling ---
 .pytest_cache/
+research/
+*.db
+*.db-wal
+*.db-shm
 .ruff_cache/
+research/
+*.db
+*.db-wal
+*.db-shm
 .mypy_cache/
+research/
+*.db
+*.db-wal
+*.db-shm
 .coverage
 htmlcov/
 
