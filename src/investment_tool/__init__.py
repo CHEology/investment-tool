@@ -1,7 +1,10 @@
-"""Portfolio analytics and market data tooling."""
+"""Investment opportunity discovery and research system.
 
-from investment_tool.portfolio import Portfolio, performance_summary
+Two-lane (negative-shock overreaction / positive step-change) discovery across
+China A-shares (SSE, SZSE, BSE) and U.S.-listed equities, per docs/DESIGN.md.
+"""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-__all__ = ["Portfolio", "performance_summary", "__version__"]
+SCHEMA_VERSION = "s0.1"
+TRANSFORM_VERSION = "s0.1"

@@ -1,85 +1,163 @@
-"""Command line entry point: `invest <command>`."""
+"""`invest` CLI — the single operator surface. Agent environments call this;
+they never touch the database directly (approved integration boundary)."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 
-import pandas as pd
+from investment_tool import config as config_mod
+from investment_tool import entities
+from investment_tool.db import connect
+from investment_tool.lineage import record_fetch
+from investment_tool.quality import Quality, QualityState
 
-from investment_tool import data as data_mod
-from investment_tool.portfolio import Portfolio, performance_summary
+
+def _cfg(conn):
+    cfg = config_mod.load("v0")
+    config_mod.register(conn, cfg, changelog="initial v0 thresholds (all EXPERIMENTAL)")
+    return cfg
 
 
-def _add_range_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--start", help="start date, YYYY-MM-DD (default: 3 years ago)")
-    parser.add_argument("--end", help="end date, YYYY-MM-DD (default: today)")
-    parser.add_argument("--no-cache", action="store_true", help="bypass the on-disk price cache")
+def cmd_seed(args) -> int:
+    conn = connect()
+    cfg = _cfg(conn)
+    market = args.market
+
+    if market in ("a", "all"):
+        from investment_tool.providers import cninfo
+
+        http = cninfo.client()
+        payload, status = cninfo.fetch_security_mapping(http)
+        state = QualityState.OK if status == 200 else QualityState.ERROR
+        quality = Quality(state, f"http={status}")
+        m = record_fetch(
+            conn, provider="cninfo", dataset="security_mapping", params={},
+            source_url=cninfo.MAPPING_URL, payload=payload, http_status=status,
+            quality=quality, config_version=cfg.id,
+        )
+        if not quality.usable_for_scan:
+            print(f"cninfo mapping fetch failed: http={status} (manifest {m.manifest_id})")
+            return 1
+        rows = cninfo.parse_security_mapping(payload)
+        n = entities.seed_a_share(conn, rows)
+        by_ex = {}
+        for r in rows:
+            by_ex[r["exchange"]] = by_ex.get(r["exchange"], 0) + 1
+        print(f"A-share seed: {n} listings {by_ex} (manifest {m.manifest_id})")
+
+    if market in ("us", "all"):
+        from investment_tool.providers import nasdaq
+        from investment_tool.providers.base import GENERIC_UA, HttpClient
+
+        http = HttpClient(user_agent=GENERIC_UA, min_interval_s=1.0)
+        total = 0
+        for url, dataset, parser in (
+            (nasdaq.NASDAQ_LISTED_URL, "nasdaqlisted", nasdaq.parse_nasdaq_listed),
+            (nasdaq.OTHER_LISTED_URL, "otherlisted", nasdaq.parse_other_listed),
+        ):
+            resp = http.get(url)
+            quality = Quality(
+                QualityState.OK if resp.status_code == 200 else QualityState.ERROR,
+                f"http={resp.status_code}",
+            )
+            m = record_fetch(
+                conn, provider="nasdaq_trader", dataset=dataset, params={},
+                source_url=url, payload=resp.content, http_status=resp.status_code,
+                quality=quality, config_version=cfg.id,
+            )
+            if not quality.usable_for_scan:
+                print(f"{dataset} fetch failed: http={resp.status_code}")
+                return 1
+            rows = parser(resp.content.decode("utf-8", errors="replace"))
+            total += entities.seed_us(conn, rows)
+            print(f"US seed [{dataset}]: {len(rows)} rows (manifest {m.manifest_id})")
+        print(f"US seed total listings inserted-or-present: {total}")
+        print("note: CIK enrichment deferred to S2 (requires SEC_USER_AGENT, decision D3)")
+
+    return 0
+
+
+def cmd_resolve(args) -> int:
+    conn = connect()
+    rows = entities.resolve(conn, args.ticker)
+    if not rows:
+        print(f"no listing found for {args.ticker!r}")
+        return 1
+    for r in rows:
+        name = r["name_zh"] or r["name_en"] or ""
+        print(
+            f"{r['listing_id']}  company={r['company_id']}  {name}  board={r['board'] or '-'}"
+            f"  ccy={r['currency']}  adr={r['is_adr']}  cik={r['cik'] or 'pending-D3'}"
+        )
+    return 0
+
+
+def cmd_fx(args) -> int:
+    conn = connect()
+    cfg = _cfg(conn)
+    from investment_tool.providers import frankfurter as fx
+
+    http = fx.client()
+    payload, status, url = fx.fetch_rate(http, args.date)
+    quality = Quality(QualityState.OK if status == 200 else QualityState.ERROR, f"http={status}")
+    m = record_fetch(
+        conn, provider="frankfurter", dataset="usd_cny", params={"date": args.date or "latest"},
+        source_url=url, payload=payload, http_status=status, quality=quality,
+        config_version=cfg.id,
+    )
+    if not quality.usable_for_scan:
+        print(f"fx fetch failed http={status}")
+        return 1
+    date, rate = fx.parse_rate(payload)
+    conn.execute(
+        "INSERT OR REPLACE INTO fx_day(pair, date, rate, source, manifest_id) VALUES(?,?,?,?,?)",
+        ("USDCNY", date, rate, "frankfurter_ecb", m.manifest_id),
+    )
+    conn.commit()
+    print(f"USDCNY {date} = {rate} (manifest {m.manifest_id})")
+    return 0
+
+
+def cmd_status(args) -> int:
+    conn = connect()
+    for table in ("company", "listing", "manifest", "security_day", "announcement",
+                  "event", "candidate", "frozen_artifact"):
+        n = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]  # noqa: S608
+        print(f"{table:16s} {n}")
+    q = conn.execute(
+        "SELECT quality_state, COUNT(*) AS n FROM manifest GROUP BY quality_state"
+    ).fetchall()
+    if q:
+        print("manifest quality:", {r["quality_state"]: r["n"] for r in q})
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="invest", description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
+    p = argparse.ArgumentParser(prog="invest", description=__doc__)
+    sub = p.add_subparsers(dest="command", required=True)
 
-    prices = sub.add_parser("prices", help="fetch and print adjusted close prices")
-    prices.add_argument("tickers", nargs="+")
-    _add_range_args(prices)
-    prices.add_argument("--tail", type=int, default=10, help="rows to display (default: 10)")
+    s = sub.add_parser("seed", help="seed the security universe from official identifier sources")
+    s.add_argument("--market", choices=["a", "us", "all"], default="all")
+    s.set_defaults(func=cmd_seed)
 
-    report = sub.add_parser("report", help="performance summary for a holdings file")
-    report.add_argument("holdings", help="path to a holdings JSON file")
-    _add_range_args(report)
-    report.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    r = sub.add_parser("resolve", help="resolve a ticker/code to company and listings")
+    r.add_argument("ticker")
+    r.set_defaults(func=cmd_resolve)
 
-    return parser
+    f = sub.add_parser("fx", help="fetch and store the ECB USD/CNY reference rate")
+    f.add_argument("--date", default=None, help="YYYY-MM-DD (default: latest)")
+    f.set_defaults(func=cmd_fx)
 
-
-def cmd_prices(args: argparse.Namespace) -> int:
-    frame = data_mod.fetch_history(
-        args.tickers, start=args.start, end=args.end, use_cache=not args.no_cache
-    )
-    print(frame.tail(args.tail).to_string(float_format=lambda v: f"{v:,.2f}"))
-    return 0
-
-
-def cmd_report(args: argparse.Namespace) -> int:
-    portfolio = Portfolio.from_json(args.holdings)
-    prices = data_mod.fetch_history(
-        portfolio.tickers, start=args.start, end=args.end, use_cache=not args.no_cache
-    )
-    equity = portfolio.equity_curve(prices).dropna()
-    summary = performance_summary(equity)
-    weights = portfolio.weights(prices.iloc[-1])
-
-    if args.json:
-        print(json.dumps({"summary": summary, "weights": weights.to_dict()}, indent=2))
-        return 0
-
-    print(f"{portfolio.name}  ({equity.index[0].date()} to {equity.index[-1].date()})\n")
-    print("Allocation")
-    for ticker, weight in weights.items():
-        print(f"  {ticker:<8} {weight:>7.2%}")
-    print("\nPerformance")
-    print(f"  Value        {summary['end_value']:>12,.2f}")
-    print(f"  Total return {summary['total_return']:>12.2%}")
-    print(f"  CAGR         {summary['cagr']:>12.2%}")
-    print(f"  Volatility   {summary['volatility']:>12.2%}")
-    print(f"  Sharpe       {summary['sharpe']:>12.2f}")
-    print(f"  Max drawdown {summary['max_drawdown']:>12.2%}")
-    return 0
+    st = sub.add_parser("status", help="table counts and manifest quality summary")
+    st.set_defaults(func=cmd_status)
+    return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    handlers = {"prices": cmd_prices, "report": cmd_report}
-    try:
-        return handlers[args.command](args)
-    except (ValueError, FileNotFoundError, KeyError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    return args.func(args)
 
 
 if __name__ == "__main__":
-    pd.set_option("display.max_rows", 200)
-    raise SystemExit(main())
+    sys.exit(main())
