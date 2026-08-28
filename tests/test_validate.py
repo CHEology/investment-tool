@@ -60,11 +60,15 @@ def test_tracked_with_peer_adjusted_return(conn, tmp_path, monkeypatch):
     assert snap["mae_raw"] <= snap["ret_raw"]
 
 
-def test_invalidated_artifact_excluded(conn):
+def test_invalidated_visible_but_never_tracked(conn):
     _seed(conn, "2026-08-28T16:00:00Z", artifact_status="INVALIDATED")
     audit = validate.run_validation(conn, asof="2026-08-28")
-    assert audit["candidates_in_ledger"] == 0
-    assert audit["excluded_invalidated"] == 1
+    assert audit["candidates_in_ledger"] == 1     # visible in the ledger
+    assert audit["tracked"] == 0                  # never a control observation
+    import json
+    snap = json.loads(conn.execute(
+        "SELECT metrics_json FROM validation_snapshot").fetchone()["metrics_json"])
+    assert snap["state"] == "EXCLUDED_INVALIDATED"
 
 
 def test_snapshot_idempotent_per_asof(conn):
@@ -73,3 +77,35 @@ def test_snapshot_idempotent_per_asof(conn):
     validate.run_validation(conn, asof="2026-08-28")
     n = conn.execute("SELECT COUNT(*) AS n FROM validation_snapshot").fetchone()["n"]
     assert n == 1
+
+
+def test_peer_baseline_mismatch_is_skipped(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(validate, "DEFAULT_DATA_DIR", tmp_path)
+    _seed(conn, "2026-08-01T16:00:00Z", n_days=20)
+    # one peer loses its early sessions -> different baseline date -> skipped
+    conn.execute("DELETE FROM security_day WHERE listing_id='SZSE:000901'"
+                 " AND trade_date<'2026-08-10'")
+    conn.commit()
+    validate.run_validation(conn, asof="2026-08-28")
+    import json
+    snap = json.loads(conn.execute(
+        "SELECT metrics_json FROM validation_snapshot").fetchone()["metrics_json"])
+    assert snap["peers_skipped_baseline_mismatch"] == 1
+    # only one comparable peer remains (<2) -> peer-adjusted honestly None
+    assert snap["ret_peer_adj"] is None
+
+
+def test_peer_membership_is_point_in_time(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(validate, "DEFAULT_DATA_DIR", tmp_path)
+    _seed(conn, "2026-08-01T16:00:00Z", n_days=20)
+    # industry reclassified AFTER tracking started: must not affect membership
+    for lid in ("SZSE:000901", "SZSE:000902"):
+        conn.execute("INSERT INTO market_snapshot(listing_id, asof_date, industry, is_st,"
+                     " source, quality) VALUES(?,?,?,0,'test','PROVISIONAL')",
+                     (lid, "2026-08-20", "改分类行业"))
+    conn.commit()
+    validate.run_validation(conn, asof="2026-08-28")
+    import json
+    snap = json.loads(conn.execute(
+        "SELECT metrics_json FROM validation_snapshot").fetchone()["metrics_json"])
+    assert snap["ret_peer_adj"] is not None  # pre-freeze membership still used

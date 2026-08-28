@@ -279,8 +279,9 @@ def cmd_credentials(args) -> int:
     except ImportError:
         print("keyring package missing; run: uv pip install -e '.[dev]'")
         return 1
-    service = f"investment-tool-{args.provider}"
-    token = getpass.getpass(f"Token for {service} (input hidden): ")
+    service = ("investment-tool-sec-ua" if args.provider == "sec"
+               else f"investment-tool-{args.provider}")
+    token = getpass.getpass(f"Value for {service} (input hidden): ")
     if not token.strip():
         print("empty token; nothing stored")
         return 1
@@ -348,6 +349,13 @@ def cmd_daily(args) -> int:
         except Exception as exc:  # noqa: BLE001
             status["scan"] = f"DEGRADED: {exc}"
             degraded = True
+
+    try:
+        vaudit = validate_mod.run_validation(conn)
+        status["validate"] = str(vaudit["states"])
+    except Exception as exc:  # noqa: BLE001
+        status["validate"] = f"DEGRADED: {exc}"
+        degraded = True
 
     try:
         status["backup"] = validate_mod.backup_database(conn)
@@ -493,7 +501,7 @@ def build_parser() -> argparse.ArgumentParser:
     sc.set_defaults(func=cmd_scan)
 
     cr = sub.add_parser("credentials", help="store a provider token via hidden input (Keychain)")
-    cr.add_argument("provider", choices=["tushare", "eodhd"])
+    cr.add_argument("provider", choices=["tushare", "eodhd", "sec"])
     cr.set_defaults(func=cmd_credentials)
 
     va = sub.add_parser("validate", help="write forward-validation snapshots (INV-10 ledger)")

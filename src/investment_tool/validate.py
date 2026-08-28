@@ -28,6 +28,9 @@ def _beijing_date(ts_utc: str) -> str:
 
 
 def _ledger_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """ALL candidates with frozen artifacts. Invalidated ones stay VISIBLE in
+    the historical ledger with an explicit excluded state — they are never
+    tracked as control observations and never silently absent."""
     return conn.execute(
         """
         SELECT c.candidate_id, c.company_id, c.state, fa.frozen_at_utc, fa.status
@@ -35,7 +38,6 @@ def _ledger_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         JOIN frozen_artifact fa ON fa.candidate_id = c.candidate_id
           AND fa.version = (SELECT MAX(version) FROM frozen_artifact
                             WHERE candidate_id = c.candidate_id)
-        WHERE fa.status != 'INVALIDATED'
         """
     ).fetchall()
 
@@ -54,11 +56,19 @@ def _adj_series(conn, listing_id: str, start: str, end: str) -> pd.Series:
     ).dropna()
 
 
-def _cell_members(conn, listing_id: str) -> list[str]:
+def _cell_members(conn, listing_id: str, ref_date: str) -> list[str]:
+    """Peer membership as of the tracking start: the latest snapshot at or
+    before ref_date (falling back to the earliest available), so later
+    industry reclassifications cannot leak into an already-started track."""
     row = conn.execute(
-        "SELECT industry FROM market_snapshot WHERE listing_id=?"
-        " ORDER BY asof_date DESC LIMIT 1", (listing_id,),
+        "SELECT industry FROM market_snapshot WHERE listing_id=? AND asof_date<=?"
+        " ORDER BY asof_date DESC LIMIT 1", (listing_id, ref_date),
     ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT industry FROM market_snapshot WHERE listing_id=?"
+            " ORDER BY asof_date ASC LIMIT 1", (listing_id,),
+        ).fetchone()
     if row is None or row["industry"] is None:
         return []
     return [
@@ -70,8 +80,12 @@ def _cell_members(conn, listing_id: str) -> list[str]:
 
 
 def _snapshot_for(conn, cand: sqlite3.Row, asof: str) -> dict:
+    if cand["status"] == "INVALIDATED":
+        return {"state": "EXCLUDED_INVALIDATED", "artifact_status": "INVALIDATED",
+                "note": "visible in the ledger; never a control observation"}
     listing = conn.execute(
-        "SELECT listing_id FROM listing WHERE company_id=? LIMIT 1", (cand["company_id"],)
+        "SELECT listing_id FROM listing WHERE company_id=? ORDER BY listing_id LIMIT 1",
+        (cand["company_id"],)
     ).fetchone()
     if listing is None:
         return {"state": "NO_LISTING"}
@@ -90,12 +104,18 @@ def _snapshot_for(conn, cand: sqlite3.Row, asof: str) -> dict:
         return {"state": "BASIS_BLOCKED_OR_NO_DATA", "ref_date": ref_date}
     cum = series / series.iloc[0] - 1.0
 
-    peers = _cell_members(conn, lid)
+    peers = _cell_members(conn, lid, ref_date)
     peer_final = None
+    peers_skipped_baseline = 0
     if len(peers) >= 2:
         finals = []
         for p in peers:
             s = _adj_series(conn, p, ref_date, asof)
+            # comparable dates: a peer must share the candidate's exact
+            # baseline session, else its cumulative return is not comparable
+            if len(s) == 0 or str(s.index[0]) != ref_date:
+                peers_skipped_baseline += 1
+                continue
             if len(s) >= len(series) // 2 and s.iloc[0] > 0:
                 finals.append(float(s.iloc[-1] / s.iloc[0] - 1.0))
         if len(finals) >= 2:
@@ -112,6 +132,7 @@ def _snapshot_for(conn, cand: sqlite3.Row, asof: str) -> dict:
         "ret_peer_adj": (float(cum.iloc[-1]) - peer_final) if peer_final is not None else None,
         "peer_median_ret": peer_final,
         "mae_raw": float(cum.min()),
+        "peers_skipped_baseline_mismatch": peers_skipped_baseline,
     }
     for w in WINDOWS:
         out[f"ret_raw_{w}s"] = float(cum.iloc[w]) if len(cum) > w else None
@@ -131,11 +152,11 @@ def run_validation(conn: sqlite3.Connection, asof: str | None = None) -> dict:
             (cand["candidate_id"], asof, json.dumps(snap, ensure_ascii=False)),
         )
     conn.commit()
-    audit = {"asof": asof, "generated_at": utc_now(), "candidates_in_ledger": len(rows),
-             "states": states,
-             "excluded_invalidated": conn.execute(
-                 "SELECT COUNT(DISTINCT candidate_id) FROM frozen_artifact"
-                 " WHERE status='INVALIDATED'").fetchone()[0]}
+    audit = {"asof": asof, "generated_at": utc_now(),
+             "candidates_in_ledger": len(rows),
+             "tracked": sum(v for k, v in states.items()
+                            if k not in ("EXCLUDED_INVALIDATED",)),
+             "states": states}
     out_dir = DEFAULT_DATA_DIR / "audit"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"validate_{asof}.json").write_text(
