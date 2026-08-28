@@ -447,6 +447,34 @@ def cmd_export(args) -> int:
     return 0
 
 
+def cmd_trial(args) -> int:
+    import json as json_mod
+
+    from investment_tool import cards as cards_mod
+    from investment_tool import config as config_mod2
+    from investment_tool import us_trial
+
+    if args.market != "us":
+        print("only --market us is implemented in this trial")
+        return 1
+    conn = connect()
+    cfg = _cfg(conn)
+    trial_cfg = config_mod2.load("us_trial_v0")
+    config_mod2.register(conn, trial_cfg,
+                         changelog="US trial thresholds (EXPERIMENTAL; A-share untouched)")
+    summary = us_trial.run_trial(conn, cfg, trial_cfg, args.asof)
+    frozen = []
+    for c in summary["candidates"]:
+        row = conn.execute("SELECT * FROM candidate WHERE candidate_id=?",
+                           (c["candidate_id"],)).fetchone()
+        content = cards_mod.render_us_card_zh(conn, row)
+        frozen.append(cards_mod.freeze_card(conn, row, content))
+    summary["frozen_cards"] = [{"artifact_id": f["artifact_id"], "sha256": f["sha256"][:12]}
+                               for f in frozen]
+    print(json_mod.dumps(summary, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
 def cmd_status(args) -> int:
     conn = connect()
     for table in ("company", "listing", "manifest", "security_day", "announcement",
@@ -538,6 +566,11 @@ def build_parser() -> argparse.ArgumentParser:
     ex = sub.add_parser("export", help="export a candidate bundle (external-agent boundary)")
     ex.add_argument("--candidate", required=True)
     ex.set_defaults(func=cmd_export)
+
+    tr = sub.add_parser("trial", help="run the US Lane A opportunity trial (EXPERIMENTAL)")
+    tr.add_argument("--market", choices=["us"], required=True)
+    tr.add_argument("--asof", required=True, help="evaluation date YYYY-MM-DD")
+    tr.set_defaults(func=cmd_trial)
 
     st = sub.add_parser("status", help="table counts and manifest quality summary")
     st.set_defaults(func=cmd_status)

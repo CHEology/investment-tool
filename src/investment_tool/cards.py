@@ -136,3 +136,71 @@ def freeze_card(conn: sqlite3.Connection, candidate_row, content: str) -> dict:
     )
     conn.commit()
     return {"artifact_id": artifact_id, "sha256": sha, "path": str(path), "version": version}
+
+
+_PCT = lambda v: f"{v * 100:+.2f}%" if isinstance(v, (int, float)) else "n/a"  # noqa: E731
+
+_US_STATE_ZH = {
+    "US_TRIAL_CANDIDATE": "试验候选（可能过度反应）",
+    "US_TRIAL_NEAR_MISS": "接近触发/观察名单",
+    "US_TRIAL_INSUFFICIENT_DATA": "数据不足",
+}
+
+
+def render_us_card_zh(conn, candidate_row) -> str:
+    p = json.loads(candidate_row["profile_json"])
+    rx = p.get("reaction", {})
+    company = conn.execute(
+        "SELECT c.name_en, l.ticker, l.exchange FROM company c"
+        " JOIN listing l ON l.company_id=c.company_id WHERE c.company_id=?"
+        " ORDER BY l.listing_id LIMIT 1", (candidate_row["company_id"],),
+    ).fetchone()
+    state_zh = _US_STATE_ZH.get(candidate_row["state"],
+                                candidate_row["state"].replace("US_TRIAL_REJECTED_", "未入围："))
+    content = p.get("content") or {}
+    lines = [
+        f"# 美股试验候选卡片：{company['name_en'] or company['ticker']}"
+        f"（{company['ticker']}.{company['exchange']}）",
+        "",
+        f"- **状态**: {state_zh} · **市值**: 暂无法获得（XBRL基本面数据留待后续切片）",
+        f"- **触发事件**: {p.get('event_type')} · 文件号 "
+        f"{p.get('accession') or '（停牌事件，无文件）'}",
+        f"- **SEC受理时间**: {p.get('accepted_at_utc') or '未获得（日期精度）'}"
+        f" · **系统首次观察**: {p.get('first_seen_at_utc')}",
+        "",
+        "## 多周期市场反应（经SPY调整；QQQ对照另列）",
+        f"- 事件后1个交易日: {_PCT(rx.get('post_ret1'))}（市场调整后 "
+        f"{_PCT(rx.get('mkt_adj_post_ret1'))}）· 事件后累计: {_PCT(rx.get('post_cum'))}"
+        f"（调整后 {_PCT(rx.get('mkt_adj_post_cum'))}）",
+        f"- 截至评估日的 1/5/21/63 日收益: {_PCT(rx.get('ret1'))} / {_PCT(rx.get('ret5'))}"
+        f" / {_PCT(rx.get('ret21'))} / {_PCT(rx.get('ret63'))}",
+        f"- 市场调整后 5/21/63 日: {_PCT(rx.get('mkt_adj_ret5'))} /"
+        f" {_PCT(rx.get('mkt_adj_ret21'))} / {_PCT(rx.get('mkt_adj_ret63'))}"
+        f" · QQQ调整后1日: {_PCT(rx.get('qqq_adj_ret1'))}",
+        f"- 事件日成交量/20日中位: {rx.get('volume_ratio'):.1f}x"
+        if isinstance(rx.get("volume_ratio"), (int, float)) else
+        "- 事件日成交量/20日中位: n/a",
+        f"- 触发条件命中: {', '.join(p.get('trigger_legs') or []) or '无'}",
+        "",
+        "## 文件内容（初步判定）",
+        f"- 主分类: **{content.get('primary', '未获取')}** · 关键词标记: "
+        f"{', '.join(content.get('flags') or []) or '无'}（{content.get('content_version', '')}）",
+        "- 暂时性中断 vs 持久性恶化: "
+        + ("倾向暂时性/有界（初步）" if candidate_row["state"] == "US_TRIAL_CANDIDATE" else "未定"),
+        "",
+        "## 为何跌幅可能（或可能不）过度",
+        f"- {p.get('excess_rationale') or p.get('reject_rationale') or '见上'}",
+        "- 反对证据：若文件披露伴随基本面恶化（收入/客户/融资条款），则跌幅可能是合理的；"
+        "本试验层未接入基本面数据，无法排除。",
+        "",
+        "## 未决问题",
+    ]
+    for qline in p.get("unresolved_questions") or ["（无记录）"]:
+        lines.append(f"- {qline}")
+    lines += [
+        "",
+        f"*试验配置 {p.get('config_version')} · 生成 {utc_now()} ·"
+        " 数据为PROVISIONAL（yfinance扫描层，终选经EODHD抽验）·"
+        " 本卡片为研究流程产物，不构成任何投资建议，无任何仓位或买卖指令。*",
+    ]
+    return "\n".join(lines)
