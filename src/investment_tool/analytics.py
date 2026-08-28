@@ -52,16 +52,30 @@ def load_panel(conn: sqlite3.Connection, start: str, end: str) -> pd.DataFrame:
     return df
 
 
-def load_cells(conn: sqlite3.Connection) -> pd.DataFrame:
-    """Cell assignment from the latest market snapshot (industry x size tercile;
-    BSE is its own size bucket). Snapshot is today-only -> retro-application to
-    past dates is PROVISIONAL and recorded as verification debt."""
+def load_cells(conn: sqlite3.Connection, asof_date: str | None = None) -> pd.DataFrame:
+    """Cell assignment from the latest snapshot available by ``asof_date``.
+
+    A missing date keeps the original latest-snapshot behavior for interactive
+    analysis.  Scans pass their date explicitly so a replay cannot consume a
+    later industry or size observation.
+    """
+    snapshot_filter = (
+        " WHERE ms.asof_date = (SELECT MAX(asof_date) FROM market_snapshot"
+        " WHERE asof_date<=?)"
+        if asof_date
+        else " WHERE ms.asof_date = (SELECT MAX(asof_date) FROM market_snapshot)"
+    )
     snap = pd.read_sql_query(
         "SELECT ms.listing_id, ms.industry, ms.float_mcap, ms.is_st, ms.name, l.exchange"
         " FROM market_snapshot ms JOIN listing l ON l.listing_id = ms.listing_id"
-        " WHERE ms.asof_date = (SELECT MAX(asof_date) FROM market_snapshot)",
+        + snapshot_filter,
         conn,
+        params=(asof_date,) if asof_date else (),
     )
+    if snap.empty:
+        return pd.DataFrame(
+            columns=["listing_id", "industry", "size_bucket", "cell", "is_st", "name"]
+        )
     snap["float_mcap_f"] = pd.to_numeric(snap["float_mcap"], errors="coerce")
     non_bse = snap[snap["exchange"] != "BSE"]
     terciles = non_bse["float_mcap_f"].quantile([1 / 3, 2 / 3]).values

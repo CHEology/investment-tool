@@ -123,10 +123,16 @@ def freeze_card(conn: sqlite3.Connection, candidate_row, content: str) -> dict:
     path.write_text(content)
     artifact_id = f"card_{candidate_row['candidate_id']}_v{version}"
     conn.execute(
+        "UPDATE frozen_artifact SET status='SUPERSEDED',"
+        " status_note=COALESCE(status_note, ?)"
+        " WHERE candidate_id=? AND kind='CARD' AND status='VALID'",
+        (f"Superseded by {artifact_id}", candidate_row["candidate_id"]),
+    )
+    conn.execute(
         "INSERT INTO frozen_artifact(artifact_id, kind, candidate_id, version, frozen_at_utc,"
-        " content_sha256, path, config_version) VALUES(?,?,?,?,?,?,?,?)",
+        " content_sha256, path, config_version, status) VALUES(?,?,?,?,?,?,?,?,?)",
         (artifact_id, "CARD", candidate_row["candidate_id"], version, utc_now(), sha,
-         str(path), candidate_row["config_version"]),
+         str(path), candidate_row["config_version"], "VALID"),
     )
     conn.commit()
     return {"artifact_id": artifact_id, "sha256": sha, "path": str(path), "version": version}

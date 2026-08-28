@@ -220,6 +220,10 @@ CREATE TABLE IF NOT EXISTS validation_snapshot(
   metrics_json TEXT NOT NULL,
   PRIMARY KEY(candidate_id, asof)
 );
+CREATE TABLE IF NOT EXISTS schema_migration(
+  migration_id TEXT PRIMARY KEY,
+  applied_at_utc TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS market_snapshot(
   listing_id TEXT NOT NULL,
   asof_date TEXT NOT NULL,
@@ -238,11 +242,65 @@ CREATE INDEX IF NOT EXISTS idx_ann_code ON announcement(sec_code, published_at_u
 CREATE INDEX IF NOT EXISTS idx_listing_company ON listing(company_id);
 """
 
+# SQLite's CREATE TABLE IF NOT EXISTS does not add columns to an existing
+# table.  Keep additive upgrades explicit so an S0 data directory can be
+# opened safely by S1 without a manual one-off ALTER TABLE session.
+ADDITIVE_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "security_day": (
+        ("ret", "REAL"),
+        ("ret_basis", "TEXT"),
+        ("adj_close", "TEXT"),
+        ("basis_epoch", "INTEGER NOT NULL DEFAULT 1"),
+    ),
+    "announcement": (
+        ("ts_precision", "TEXT NOT NULL DEFAULT 'DATE'"),
+        ("ts_anomaly", "TEXT"),
+        ("relevance", "TEXT"),
+    ),
+    "frozen_artifact": (
+        ("status", "TEXT NOT NULL DEFAULT 'VALID'"),
+        ("status_note", "TEXT"),
+    ),
+}
+
 
 def db_path(data_dir: Path | None = None) -> Path:
     root = data_dir or DEFAULT_DATA_DIR
     root.mkdir(parents=True, exist_ok=True)
     return root / "investment.db"
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Apply idempotent, additive migrations needed by the current code.
+
+    Identifiers and SQL fragments come only from the trusted constant above;
+    no external input is interpolated here.
+    """
+    for table, columns in ADDITIVE_MIGRATIONS.items():
+        present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, declaration in columns:
+            if name not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
+        " VALUES('s1_additive_columns', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+    )
+    lifecycle_done = conn.execute(
+        "SELECT 1 FROM schema_migration WHERE migration_id='s1_artifact_lifecycle'"
+    ).fetchone()
+    if lifecycle_done is None:
+        conn.execute(
+            "UPDATE frozen_artifact AS older SET status='SUPERSEDED',"
+            " status_note=COALESCE(status_note, 'Superseded by a later frozen version')"
+            " WHERE status='VALID' AND EXISTS (SELECT 1 FROM frozen_artifact AS newer"
+            " WHERE newer.candidate_id=older.candidate_id AND newer.kind=older.kind"
+            " AND newer.version>older.version AND newer.status='VALID')"
+        )
+        conn.execute(
+            "INSERT INTO schema_migration(migration_id, applied_at_utc)"
+            " VALUES('s1_artifact_lifecycle', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+        )
+    conn.commit()
 
 
 def connect(data_dir: Path | None = None) -> sqlite3.Connection:
@@ -252,4 +310,5 @@ def connect(data_dir: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(DDL)
+    _migrate_schema(conn)
     return conn

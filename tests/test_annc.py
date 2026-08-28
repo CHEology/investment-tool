@@ -1,4 +1,11 @@
-from investment_tool.annc import CONTENT_REVIEW, HARD_NEGATIVE, POSITIVE, classify, eligible_from
+from investment_tool.annc import (
+    CONTENT_REVIEW,
+    HARD_NEGATIVE,
+    POSITIVE,
+    classify,
+    eligible_from,
+    temporally_eligible,
+)
 
 
 def test_hard_negatives():
@@ -36,3 +43,12 @@ def test_temporal_eligibility_semantics():
     t0 = "2026-08-27"
     e = eligible_from("2026-08-28T16:00:00Z")  # available 08-29 Beijing
     assert not (e <= t0)
+
+
+def test_temporal_eligibility_also_requires_first_seen_before_scan_cutoff():
+    ann = {
+        "eligible_from": "2026-08-20",
+        "first_seen_at_utc": "2026-08-29T01:00:00Z",
+    }
+    assert not temporally_eligible(ann, "2026-08-27", "2026-08-28T15:59:59Z")
+    assert temporally_eligible(ann, "2026-08-27", "2026-08-29T15:59:59Z")

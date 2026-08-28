@@ -1,3 +1,6 @@
+import sqlite3
+
+from investment_tool.db import connect
 from investment_tool.numeric import dec, dec_from_db, dec_text
 
 
@@ -47,3 +50,65 @@ def test_missing_close_stays_null_not_zero(conn):
 def test_market_snapshot_table_exists(conn):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(market_snapshot)").fetchall()}
     assert {"listing_id", "asof_date", "total_mcap", "float_mcap", "industry", "is_st"} <= cols
+
+
+def test_s0_database_is_migrated_without_losing_rows(tmp_path):
+    """CREATE TABLE IF NOT EXISTS alone cannot upgrade an existing S0 DB."""
+    path = tmp_path / "investment.db"
+    old = sqlite3.connect(path)
+    old.executescript(
+        """
+        CREATE TABLE security_day(
+          listing_id TEXT NOT NULL, trade_date TEXT NOT NULL,
+          open TEXT, high TEXT, low TEXT, close TEXT, prev_close TEXT,
+          volume TEXT, amount TEXT, pct_chg REAL, adj_factor TEXT,
+          adj_method TEXT NOT NULL DEFAULT 'NONE', currency TEXT NOT NULL,
+          limit_state TEXT NOT NULL DEFAULT 'FREE', provider TEXT NOT NULL,
+          quality TEXT NOT NULL, manifest_id TEXT NOT NULL,
+          PRIMARY KEY(listing_id, trade_date)
+        );
+        CREATE TABLE announcement(
+          ann_id TEXT PRIMARY KEY, exchange_column TEXT NOT NULL, sec_code TEXT,
+          org_id TEXT, title TEXT NOT NULL, adjunct_url TEXT, published_at_utc TEXT,
+          first_seen_at_utc TEXT NOT NULL, category TEXT, event_id TEXT,
+          manifest_id TEXT NOT NULL
+        );
+        CREATE TABLE frozen_artifact(
+          artifact_id TEXT PRIMARY KEY, kind TEXT NOT NULL, candidate_id TEXT,
+          version INTEGER NOT NULL, frozen_at_utc TEXT NOT NULL,
+          content_sha256 TEXT NOT NULL, path TEXT NOT NULL, config_version TEXT NOT NULL
+        );
+        INSERT INTO security_day(
+          listing_id, trade_date, close, currency, provider, quality, manifest_id
+        ) VALUES('SZSE:000001','2026-08-28','10.00','CNY','legacy','OK','m0');
+        INSERT INTO frozen_artifact VALUES(
+          'card_c1_v1','CARD','c1',1,'2026-08-27T00:00:00Z','s1','one.md','v0'
+        );
+        INSERT INTO frozen_artifact VALUES(
+          'card_c1_v2','CARD','c1',2,'2026-08-28T00:00:00Z','s2','two.md','v0'
+        );
+        """
+    )
+    old.commit()
+    old.close()
+
+    upgraded = connect(tmp_path)
+    sec_cols = {r["name"] for r in upgraded.execute("PRAGMA table_info(security_day)")}
+    ann_cols = {r["name"] for r in upgraded.execute("PRAGMA table_info(announcement)")}
+    art_cols = {r["name"] for r in upgraded.execute("PRAGMA table_info(frozen_artifact)")}
+    assert {"ret", "ret_basis", "adj_close", "basis_epoch"} <= sec_cols
+    assert {"ts_precision", "ts_anomaly", "relevance"} <= ann_cols
+    assert {"status", "status_note"} <= art_cols
+    row = upgraded.execute("SELECT close, basis_epoch FROM security_day").fetchone()
+    assert row["close"] == "10.00" and row["basis_epoch"] == 1
+    assert upgraded.execute(
+        "SELECT COUNT(*) AS n FROM schema_migration WHERE migration_id='s1_additive_columns'"
+    ).fetchone()["n"] == 1
+    states = upgraded.execute(
+        "SELECT version, status FROM frozen_artifact ORDER BY version"
+    ).fetchall()
+    assert [(r["version"], r["status"]) for r in states] == [
+        (1, "SUPERSEDED"),
+        (2, "VALID"),
+    ]
+    upgraded.close()

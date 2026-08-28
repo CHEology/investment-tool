@@ -172,10 +172,13 @@ def cmd_backfill(args) -> int:
     if args.limit:
         rows = rows[: args.limit]
     if args.skip_existing:
+        min_history = int(cfg.value("universe.min_history_days"))
         have = {
             r["listing_id"]
             for r in conn.execute(
-                "SELECT listing_id, COUNT(*) AS n FROM security_day GROUP BY listing_id HAVING n>50"
+                "SELECT listing_id, COUNT(ret) AS n FROM security_day"
+                " GROUP BY listing_id HAVING n>=?",
+                (min_history,),
             )
         }
         rows = [r for r in rows if r["listing_id"] not in have]
@@ -187,20 +190,23 @@ def cmd_backfill(args) -> int:
     failures = 0
     consecutive = 0
     breaker_trips = 0
+    aborted = False
+    processed = 0
     for i, lst in enumerate(rows, 1):
+        processed = i
         try:
-            bars = spine.backfill_listing(conn, http_by_provider, cfg.id, lst, beg)
-            total_bars += bars
-            if bars > 0:
+            result = spine.backfill_listing(conn, http_by_provider, cfg.id, lst, beg)
+            total_bars += result.bars
+            if result.bars > 0:
                 consecutive = 0
             else:
                 # empty history (delisted/suspended) is data, not provider
                 # unhealth: only count toward the breaker on fetch ERRORs
-                err = conn.execute(
-                    "SELECT quality_state FROM manifest WHERE dataset='kline_daily'"
-                    " ORDER BY retrieved_at_utc DESC LIMIT 1"
-                ).fetchone()
-                consecutive = consecutive + 1 if (err and err["quality_state"] == "ERROR") else 0
+                if result.quality_state == "ERROR":
+                    failures += 1
+                    consecutive += 1
+                else:
+                    consecutive = 0
         except Exception as exc:  # noqa: BLE001 - keep the run alive; each failure is manifested
             failures += 1
             consecutive += 1
@@ -212,6 +218,7 @@ def cmd_backfill(args) -> int:
             if breaker_trips >= 2:
                 print(f"circuit breaker: aborting at {i}/{len(rows)};"
                       " resume later with --skip-existing")
+                aborted = True
                 break
             print("circuit breaker: 8 consecutive empty/failed; cooling down 120s")
             time_mod.sleep(120)
@@ -223,9 +230,10 @@ def cmd_backfill(args) -> int:
         " WHERE dataset='kline_daily' GROUP BY 1,2"
     ).fetchall()
     print("provider health:", [(r["provider"], r["quality_state"], r["n"]) for r in q])
-    print(f"backfill done: {len(rows)} listings, {total_bars} bars, {failures} failures,"
-          f" breaker_trips={breaker_trips}")
-    return 0
+    outcome = "incomplete" if aborted else "done"
+    print(f"backfill {outcome}: {processed}/{len(rows)} listings processed, {total_bars} bars,"
+          f" {failures} failures, breaker_trips={breaker_trips}")
+    return 1 if aborted else 0
 
 
 def cmd_scan(args) -> int:
@@ -320,7 +328,9 @@ def build_parser() -> argparse.ArgumentParser:
     ib = sub.add_parser("ingest-benchmarks", help="ingest benchmark index history + CN calendar")
     ib.set_defaults(func=cmd_ingest_benchmarks)
 
-    bf = sub.add_parser("backfill", help="backfill daily bars per listing (Eastmoney PROVISIONAL)")
+    bf = sub.add_parser(
+        "backfill", help="backfill daily bars (Tencent qfq / Sina BSE, PROVISIONAL)"
+    )
     bf.add_argument("--ticker", default=None)
     bf.add_argument("--industry", default=None, help="restrict to one snapshot industry")
     bf.add_argument("--shard", default=None, help="i/n parallel shard, e.g. 2/4")

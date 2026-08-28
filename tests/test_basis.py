@@ -90,7 +90,7 @@ class _FakeHttp:
         return R(self.closes)
 
 
-def test_provider_rewrite_bumps_epoch_and_replaces_history(conn, tmp_path, monkeypatch):
+def test_provider_rewrite_bumps_epoch_without_deleting_raw_history(conn, tmp_path, monkeypatch):
     import investment_tool.providers.tencent as tencent_mod
 
     _seed_listing(conn)
@@ -102,17 +102,26 @@ def test_provider_rewrite_bumps_epoch_and_replaces_history(conn, tmp_path, monke
     import investment_tool.db as db_mod
     monkeypatch.setattr(db_mod, "DEFAULT_DATA_DIR", tmp_path)
     http = {"tencent": _FakeHttp(["10.0", "10.1", "10.2"]), "sina": None}
-    spine.backfill_listing(conn, http, "v0.1", lst, "20260801")
+    first = spine.backfill_listing(conn, http, "v0.1", lst, "20260801")
+    assert first.bars == 3 and first.quality_state == "PROVISIONAL"
     e1 = conn.execute("SELECT MAX(basis_epoch) AS e FROM security_day"
                       " WHERE listing_id='SZSE:000777'").fetchone()["e"]
     assert e1 == 1
-    # provider rewrites the series (corporate action) -> epoch bump + full replace
+    # A separately sourced raw snapshot overlaps the adjusted history.  It is
+    # canonical evidence and must survive a later qfq rewrite.
+    conn.execute(
+        "UPDATE security_day SET open='20.00', high='21.00', low='19.50', close='20.50',"
+        " amount='9000' WHERE listing_id='SZSE:000777' AND trade_date='2026-08-18'"
+    )
+    conn.commit()
+    # provider rewrites the series (corporate action) -> epoch bump + analytical replacement
     http = {"tencent": _FakeHttp(["5.0", "5.05", "5.1"]), "sina": None}
     spine.backfill_listing(conn, http, "v0.1", lst, "20260801")
-    rows = conn.execute("SELECT basis_epoch, adj_close FROM security_day"
+    rows = conn.execute("SELECT trade_date, basis_epoch, adj_close, close, amount FROM security_day"
                         " WHERE listing_id='SZSE:000777' ORDER BY trade_date").fetchall()
     assert all(r["basis_epoch"] == 2 for r in rows)
     assert dec_from_db(rows[0]["adj_close"]) is not None
+    assert rows[0]["close"] == "20.50" and rows[0]["amount"] == "9000"
     obs = conn.execute("SELECT COUNT(*) AS n FROM observation"
                        " WHERE kind='corporate_action_detected'").fetchone()["n"]
     assert obs == 1

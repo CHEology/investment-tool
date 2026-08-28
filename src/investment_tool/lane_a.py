@@ -21,6 +21,19 @@ from investment_tool.numeric import dec
 PARAMS_DIR = DEFAULT_DATA_DIR / "research" / "params"
 
 
+def _scan_cutoff_utc(scan_date: str) -> str:
+    """End of the requested A-share calendar date (23:59:59 Asia/Shanghai)."""
+    return f"{scan_date}T15:59:59Z"
+
+
+def _visible_price_observations(conn: sqlite3.Connection, scan_date: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT obs_id, listing_id, payload_json, first_seen_at_utc FROM observation"
+        " WHERE kind='price_trigger' AND first_seen_at_utc<=?",
+        (_scan_cutoff_utc(scan_date),),
+    ).fetchall()
+
+
 def _sessions(conn, end_date: str, n: int) -> list[str]:
     rows = conn.execute(
         "SELECT date FROM calendar_day WHERE exchange='SZSE' AND is_trading=1 AND date<=?"
@@ -38,7 +51,7 @@ def run_scan(conn: sqlite3.Connection, cfg, scan_date: str, t0_lookback: int = 5
     start = sessions[0]
 
     df = analytics.load_panel(conn, start, scan_date)
-    cells = analytics.load_cells(conn)
+    cells = analytics.load_cells(conn, scan_date)
     panel = analytics.build_ar_panel(
         df, cells,
         min_peers=int(cfg.value("peer_cells.min_peer_count")),
@@ -58,12 +71,23 @@ def run_scan(conn: sqlite3.Connection, cfg, scan_date: str, t0_lookback: int = 5
     bucket_map = dict(zip(cells["listing_id"], cells["size_bucket"], strict=False))
     listings = {r["listing_id"]: r for r in conn.execute(
         "SELECT listing_id, ticker, exchange, board, cninfo_org_id, company_id FROM listing"
+        " WHERE exchange IN ('SSE','SZSE','BSE') AND status='LISTED'"
     ).fetchall()}
+
+    eligible_history = conn.execute(
+        "SELECT COUNT(*) AS n FROM (SELECT sd.listing_id FROM security_day sd"
+        " JOIN listing l ON l.listing_id=sd.listing_id"
+        " WHERE l.exchange IN ('SSE','SZSE','BSE') AND l.status='LISTED'"
+        " GROUP BY sd.listing_id HAVING COUNT(sd.ret)>=?)",
+        (min_hist,),
+    ).fetchone()["n"]
 
     t0_candidates = sessions[-t0_lookback:]
     audit: dict = {
         "scan_date": scan_date, "config_version": cfg.id, "generated_at": utc_now(),
         "universe": len(listings), "scanned": int(panel.ar.shape[1]),
+        "history_eligible": eligible_history,
+        "history_coverage_ratio": eligible_history / len(listings) if listings else 0.0,
         "triggers": 0, "shadows": 0, "data_insufficient": 0,
         "gate_failures": {}, "candidates": {}, "open_plans": 0, "events_linked": 0,
         "trigger_detail": [],
@@ -75,10 +99,10 @@ def run_scan(conn: sqlite3.Connection, cfg, scan_date: str, t0_lookback: int = 5
     # Lookahead hygiene: a (possibly backdated) scan may only see trigger
     # observations whose t0 is at or before its own scan date — never
     # observations created by scans of later dates.
+    visible_triggers = _visible_price_observations(conn, scan_date)
     seen_pairs = {
         (r["listing_id"], json.loads(r["payload_json"]).get("t0"))
-        for r in conn.execute("SELECT listing_id, payload_json FROM observation"
-                              " WHERE kind='price_trigger'")
+        for r in visible_triggers
         if (json.loads(r["payload_json"]).get("t0") or "9999") <= scan_date
     }
     # Episode cooldown: one anchor trigger per listing per 10 sessions — later
@@ -88,8 +112,7 @@ def run_scan(conn: sqlite3.Connection, cfg, scan_date: str, t0_lookback: int = 5
     cooldown_floor = sessions[-10] if len(sessions) >= 10 else sessions[0]
     in_cooldown = {
         r["listing_id"]
-        for r in conn.execute("SELECT listing_id, payload_json FROM observation"
-                              " WHERE kind='price_trigger'")
+        for r in visible_triggers
         if cooldown_floor <= json.loads(r["payload_json"]).get("t0", "") <= scan_date
     }
     audit["basis_blocked"] = len(df.attrs.get("basis_blocked", []))
@@ -101,7 +124,8 @@ def run_scan(conn: sqlite3.Connection, cfg, scan_date: str, t0_lookback: int = 5
         ),
         "verification_debt": [
             "PROVISIONAL scan spine (tencent qfq / sina raw / eastmoney snapshot pct)",
-            "industry & size cells retro-applied from latest snapshot (PIT forward-correct only)",
+            "industry & size cells use the latest snapshot available by scan date;"
+            " historical coverage remains sparse",
             "Lane A event-path trigger (verified negative event without price move) is"
             " configured but unwired until full-market announcement ingestion (S3)",
         ],
@@ -162,7 +186,7 @@ def run_scan(conn: sqlite3.Connection, cfg, scan_date: str, t0_lookback: int = 5
 
         # ---- hard gates ----
         bars = conn.execute(
-            "SELECT COUNT(*) AS n FROM security_day WHERE listing_id=?", (listing_id,)
+            "SELECT COUNT(ret) AS n FROM security_day WHERE listing_id=?", (listing_id,)
         ).fetchone()["n"]
         if bars < min_hist:
             bump(audit["gate_failures"], "HISTORY_LT_180D")
@@ -196,7 +220,8 @@ def run_scan(conn: sqlite3.Connection, cfg, scan_date: str, t0_lookback: int = 5
             continue
         # Temporal eligibility: an announcement can only explain sessions at or
         # after its first public availability (date precision -> Beijing date).
-        eligible = [a for a in anns if a.get("eligible_from") and a["eligible_from"] <= t0]
+        cutoff_utc = _scan_cutoff_utc(scan_date)
+        eligible = [a for a in anns if annc.temporally_eligible(a, t0, cutoff_utc)]
         hard = [a for a in eligible if a["relevance"] == annc.HARD_NEGATIVE]
         review = [a for a in eligible if a["relevance"] == annc.CONTENT_REVIEW]
         # HARD_NEGATIVE announcements are events regardless of this episode's
@@ -205,12 +230,15 @@ def run_scan(conn: sqlite3.Connection, cfg, scan_date: str, t0_lookback: int = 5
                   for a in anns if a["relevance"] == annc.HARD_NEGATIVE]
         audit["events_linked"] += len(events)
 
-        cand_state, profile = _assess(conn, cfg, panel, listing_id, lst, t0, w, mm_car, sigma,
-                                      liq, adv, anns, hard, review, ratio_min)
+        cand_state, profile = _assess(
+            conn, cfg, panel, listing_id, lst, t0, w, mm_car, sigma,
+            liq, adv, anns, hard, review, ratio_min, scan_date, cutoff_utc,
+        )
         bump(audit["candidates"], cand_state)
         if cand_state == "PENDING_ATTRIBUTION":
-            _write_search_plan(conn, lst, t0, detail)
+            created = _write_search_plan(conn, lst, t0, detail)
             audit["open_plans"] += 1
+            audit["plans_created"] = audit.get("plans_created", 0) + int(created)
         cid = _write_candidate(conn, cfg, lst, cand_state, profile)
         audit["touched_candidates"].append(cid)
 
@@ -227,10 +255,13 @@ def run_scan(conn: sqlite3.Connection, cfg, scan_date: str, t0_lookback: int = 5
         c20 = float(tail20.get(lid_)) if pd.notna(tail20.get(lid_)) else None
         if (c10 is not None and c10 <= car10_thr) or (c20 is not None and c20 <= car20_thr):
             slow += 1
+            obs_id = uuid.uuid5(
+                uuid.NAMESPACE_URL, f"slow_drawdown_shadow:{scan_date}:{lid_}"
+            ).hex
             conn.execute(
                 "INSERT INTO observation(obs_id, kind, listing_id, payload_json,"
-                " first_seen_at_utc, state) VALUES(?,?,?,?,?,?)",
-                (uuid.uuid4().hex, "slow_drawdown_shadow", lid_,
+                " first_seen_at_utc, state) VALUES(?,?,?,?,?,?) ON CONFLICT(obs_id) DO NOTHING",
+                (obs_id, "slow_drawdown_shadow", lid_,
                  json.dumps({"scan_date": scan_date, "car10": c10, "car20": c20,
                              "telemetry_only": True}), utc_now(), "NEW"),
             )
@@ -242,19 +273,20 @@ def run_scan(conn: sqlite3.Connection, cfg, scan_date: str, t0_lookback: int = 5
 
 
 def _assess(conn, cfg, panel, listing_id, lst, t0, w, mm_car, sigma, liq, adv,
-            anns, hard, review, ratio_min):
+            anns, hard, review, ratio_min, scan_date, cutoff_utc):
     ineligible_relevant = [
         a for a in anns
         if a["relevance"] in (annc.HARD_NEGATIVE, annc.CONTENT_REVIEW)
-        and not (a.get("eligible_from") and a["eligible_from"] <= t0)
+        and not annc.temporally_eligible(a, t0, cutoff_utc)
     ]
     profile = {
         "t0": t0, "car_peer": w["car"], "car_mm": mm_car, "window_state": w["state"],
         "sigma": sigma, "liquidity": {"class": liq, "adv60_usd": adv},
         "announcements": [
             {"title": a["title"], "type": a["event_type"], "published": a["published_at_utc"],
-             "relevance": a["relevance"], "eligible_from": a.get("eligible_from"),
-             "eligible_for_t0": bool(a.get("eligible_from") and a["eligible_from"] <= t0)}
+             "first_seen": a.get("first_seen_at_utc"), "relevance": a["relevance"],
+             "eligible_from": a.get("eligible_from"),
+             "eligible_for_t0": annc.temporally_eligible(a, t0, cutoff_utc)}
             for a in anns
         ],
         "attribution": {
@@ -264,7 +296,7 @@ def _assess(conn, cfg, panel, listing_id, lst, t0, w, mm_car, sigma, liq, adv,
         },
         "verification_debt": [
             "PROVISIONAL scan spine (tencent qfq / sina raw / eastmoney snapshot)",
-            "cells retro-applied from latest snapshot (PIT forward-correct only)",
+            "industry/size cells are PIT-bounded but historical snapshots may be unavailable",
         ],
     }
     pfile = PARAMS_DIR / f"{lst['ticker']}_{t0}.yaml"
@@ -288,11 +320,11 @@ def _assess(conn, cfg, panel, listing_id, lst, t0, w, mm_car, sigma, liq, adv,
     # adjusted mixing); shares implicitly constant (PROVISIONAL, on the card).
     snap = conn.execute(
         "SELECT total_mcap, asof_date FROM market_snapshot WHERE listing_id=?"
-        " ORDER BY asof_date DESC LIMIT 1", (listing_id,),
+        " AND asof_date<=? ORDER BY asof_date DESC LIMIT 1", (listing_id, scan_date),
     ).fetchone()
     adj_now = conn.execute(
         "SELECT adj_close FROM security_day WHERE listing_id=? AND adj_close IS NOT NULL"
-        " ORDER BY trade_date DESC LIMIT 1", (listing_id,),
+        " AND trade_date<=? ORDER BY trade_date DESC LIMIT 1", (listing_id, scan_date),
     ).fetchone()
     adj_t0m1 = conn.execute(
         "SELECT adj_close FROM security_day WHERE listing_id=? AND adj_close IS NOT NULL"
@@ -326,12 +358,21 @@ def _write_search_plan(conn, lst, t0, detail):
         "stop_conditions": ["primary_source_found", "budgets_exhausted", "packs_exhausted"],
         "mode": "C0_HUMAN_RUNNABLE",
     }
+    created_from = f"trigger:{lst['ticker']}:{t0}"
+    existing = conn.execute(
+        "SELECT plan_id FROM search_plan WHERE created_from=? AND status='OPEN' LIMIT 1",
+        (created_from,),
+    ).fetchone()
+    if existing:
+        return False
+    company_id = lst["company_id"] if "company_id" in lst.keys() else None
     conn.execute(
         "INSERT INTO search_plan(plan_id, route, created_from, company_id, plan_json, status)"
         " VALUES(?,?,?,?,?,?)",
-        (uuid.uuid4().hex, "PRICE_FIRST", f"trigger:{lst['ticker']}:{t0}",
-         None, json.dumps(plan, ensure_ascii=False), "OPEN"),
+        (uuid.uuid4().hex, "PRICE_FIRST", created_from,
+         company_id, json.dumps(plan, ensure_ascii=False), "OPEN"),
     )
+    return True
 
 
 def _write_candidate(conn, cfg, lst, state, profile):
@@ -368,7 +409,9 @@ def _write_audit(audit: dict) -> Path:
     md = [
         f"# 每日扫描审计 {audit['scan_date']}",
         "",
-        f"- 全市场证券数: {audit['universe']} · 有数据可扫: {audit['scanned']}",
+        f"- A股上市范围: {audit['universe']} · 收益面板: {audit['scanned']}"
+        f" · 历史硬门合格: {audit['history_eligible']}"
+        f" ({audit['history_coverage_ratio']:.1%})",
         f"- 价格触发: {audit['triggers']} · 影子触发(近似未达): {audit['shadows']}"
         f" · 数据不足: {audit['data_insufficient']}",
         f"- 硬性闸门拒绝: {json.dumps(audit['gate_failures'], ensure_ascii=False)}",
@@ -383,7 +426,8 @@ def _write_audit(audit: dict) -> Path:
         md.append("")
         md.append(
             "**零机会结果：本日无候选达到研究准入（PROFILED_EXCESS=0）。"
-            "以上为完整漏斗与拒绝/待定分布——零输出是有效结果 (INV-6)。**"
+            "以上为当前已覆盖样本的漏斗与拒绝/待定分布；覆盖率见上方。"
+            "零输出是有效结果 (INV-6)，但不等于全市场不存在机会。**"
         )
     md.append("")
     md.append(f"*配置 {audit['config_version']} · 生成 {audit['generated_at']} · 冻结v0规则*")

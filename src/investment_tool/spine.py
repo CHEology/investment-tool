@@ -7,6 +7,7 @@ taint propagates to any candidate as verification debt (DESIGN 5.9).
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from investment_tool.lineage import record_fetch, utc_now
@@ -17,6 +18,13 @@ PROV = QualityState.PROVISIONAL.value
 
 # Board price limits (frozen v0 config mirrors these; ST on main board is 5%).
 BOARD_LIMITS = {"MAIN": "0.10", "CHINEXT": "0.20", "STAR": "0.20", "BSE": "0.30"}
+
+
+@dataclass(frozen=True)
+class BackfillResult:
+    bars: int
+    quality_state: str
+    provider: str
 
 
 def limit_state(pct_chg: float | None, board: str | None, is_st: bool) -> str:
@@ -142,7 +150,7 @@ def ingest_snapshot(conn: sqlite3.Connection, config_version: str, asof_date: st
 
 
 def backfill_listing(conn, http_by_provider: dict, config_version: str, listing_row,
-                     beg: str) -> int:
+                     beg: str) -> BackfillResult:
     """Route by exchange: Tencent (SSE/SZSE, qfq) or Sina (BSE, raw). Both are
     PROVISIONAL scan-tier sources; pct_chg is derived from consecutive closes."""
     from investment_tool.providers import sina, tencent
@@ -172,10 +180,14 @@ def backfill_listing(conn, http_by_provider: dict, config_version: str, listing_
         payload=payload, http_status=status, quality=quality, config_version=config_version,
     )
     if not (status == 200 and content_ok):
-        return 0
+        return BackfillResult(0, QualityState.ERROR.value, provider)
     bars = (sina.parse_kline(payload) if provider == "sina"
             else tencent.parse_kline(payload, sym))
-    return store_kline_bars(conn, listing_row, provider, adj, bars, m.manifest_id)
+    return BackfillResult(
+        store_kline_bars(conn, listing_row, provider, adj, bars, m.manifest_id),
+        QualityState.PROVISIONAL.value,
+        provider,
+    )
 
 
 def store_kline_bars(conn, listing_row, provider: str, adj: str, bars: list[dict],
@@ -193,8 +205,10 @@ def store_kline_bars(conn, listing_row, provider: str, adj: str, bars: list[dict
 
     # Basis-epoch handling (adjusted lineage only): if fetched adjusted closes
     # disagree with stored ones on overlapping dates, the provider rewrote the
-    # series after a corporate action -> bump the epoch and REPLACE the whole
-    # stored history so a single listing never mixes epochs.
+    # series after a corporate action -> bump the epoch and clear the old
+    # analytical basis before writing the replacement.  Canonical raw
+    # snapshot fields must survive this operation: adjusted-history rewrites
+    # are not permission to delete a separately sourced raw observation.
     is_adjusted = provider == "tencent"
     epoch_row = conn.execute(
         "SELECT MAX(basis_epoch) AS e FROM security_day WHERE listing_id=?", (lid,)
@@ -215,7 +229,11 @@ def store_kline_bars(conn, listing_row, provider: str, adj: str, bars: list[dict
         )
         if mismatch:
             epoch += 1
-            conn.execute("DELETE FROM security_day WHERE listing_id=?", (lid,))
+            conn.execute(
+                "UPDATE security_day SET ret=NULL, ret_basis=NULL, adj_close=NULL,"
+                " basis_epoch=? WHERE listing_id=?",
+                (epoch, lid),
+            )
             conn.execute(
                 "INSERT INTO observation(obs_id, kind, listing_id, payload_json,"
                 " first_seen_at_utc, state) VALUES(hex(randomblob(8)),"

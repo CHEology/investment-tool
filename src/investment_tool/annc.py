@@ -76,6 +76,13 @@ def eligible_from(published_at_utc: str | None) -> str | None:
     return beijing.strftime("%Y-%m-%d")
 
 
+def temporally_eligible(ann: dict, t0: str, asof_utc: str) -> bool:
+    """Whether evidence was public by t0 and known to the system by scan time."""
+    public_date = ann.get("eligible_from")
+    first_seen = ann.get("first_seen_at_utc")
+    return bool(public_date and public_date <= t0 and first_seen and first_seen <= asof_utc)
+
+
 def _client() -> HttpClient:
     http = HttpClient(user_agent=BROWSER_UA, min_interval_s=1.5)
     # Cookie preflight (endpoint expects a session).
@@ -164,9 +171,24 @@ def ingest_for_listing(conn: sqlite3.Connection, config_version: str, listing_ro
                 r["adjunct_url"], pub, precision, anomaly, now, etype, relevance, m.manifest_id,
             ),
         )
-        stored.append({**r, "event_type": etype, "lane": lane, "relevance": relevance,
-                       "ts_precision": precision, "ts_anomaly": anomaly,
-                       "eligible_from": eligible_from(pub)})
+        # INSERT OR IGNORE preserves the original detection timestamp.  Always
+        # return that canonical value instead of pretending a refetch is the
+        # first time the system saw the announcement.
+        canonical = conn.execute(
+            "SELECT first_seen_at_utc, ts_precision, ts_anomaly FROM announcement"
+            " WHERE ann_id=?",
+            (r["ann_id"],),
+        ).fetchone()
+        stored.append({
+            **r,
+            "event_type": etype,
+            "lane": lane,
+            "relevance": relevance,
+            "ts_precision": canonical["ts_precision"],
+            "ts_anomaly": canonical["ts_anomaly"],
+            "first_seen_at_utc": canonical["first_seen_at_utc"],
+            "eligible_from": eligible_from(pub),
+        })
     conn.commit()
     return stored
 
@@ -179,10 +201,11 @@ def create_event_from_announcement(conn: sqlite3.Connection, company_id: str, an
         f"{company_id}|{ann['event_type']}|{ann['ann_id']}".encode()
     ).hexdigest()[:16]
     now = utc_now()
+    first_seen = ann.get("first_seen_at_utc") or now
     conn.execute(
         "INSERT OR IGNORE INTO event(event_id, scope, type, published_at_utc, first_seen_at_utc,"
         " state, lane_relevance) VALUES(?,?,?,?,?,?,?)",
-        (event_id, "COMPANY", ann["event_type"], ann["published_at_utc"], now, "VERIFIED",
+        (event_id, "COMPANY", ann["event_type"], ann["published_at_utc"], first_seen, "VERIFIED",
          ann["lane"]),
     )
     conn.execute(
@@ -197,7 +220,7 @@ def create_event_from_announcement(conn: sqlite3.Connection, company_id: str, an
         " excerpt, dims_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (
             "evd_" + ann["ann_id"], event_id, ann["adjunct_url"] or "cninfo:" + ann["ann_id"],
-            "cninfo.com.cn", ann["published_at_utc"], now, now,
+            "cninfo.com.cn", ann["published_at_utc"], now, first_seen,
             hashlib.sha256(
                 json.dumps(ann, sort_keys=True, ensure_ascii=False).encode()
             ).hexdigest(),

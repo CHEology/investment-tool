@@ -47,3 +47,10 @@ def test_card_renders_zh_and_freezes(conn, tmp_path, monkeypatch):
     frozen2 = cards.freeze_card(conn, row, content + "\nupdate")
     assert frozen2["version"] == 2
     assert conn.execute("SELECT COUNT(*) AS n FROM frozen_artifact").fetchone()["n"] == 2
+    states = conn.execute(
+        "SELECT version, status FROM frozen_artifact ORDER BY version"
+    ).fetchall()
+    assert [(r["version"], r["status"]) for r in states] == [
+        (1, "SUPERSEDED"),
+        (2, "VALID"),
+    ]
