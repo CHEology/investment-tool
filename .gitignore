@@ -1,0 +1,46 @@
+# --- Secrets: never commit ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+secrets.yml
+secrets.yaml
+.secrets/
+
+# --- Local data & caches (may contain personal holdings) ---
+data/*
+!data/.gitkeep
+*.csv
+!tests/fixtures/*.csv
+*.parquet
+*.sqlite
+*.db
+cache/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# --- Tooling ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
