@@ -43,9 +43,16 @@ keys on first_seen), `retrieved_at_utc` (this fetch, in manifests).
 ## Lane A (S1)
 
 - t0 = first tradable session at-or-after disclosure timestamp.
-- Primary AR: r_i - median(r, PIT sector x size cell); secondary: market model
-  (beta 250d, min 120, winsorized) vs size-segmented benchmark. Gate on the
-  more conservative.
+- Primary AR: r_i - median(r, PIT sector x size cell). Triggering gates on the
+  peer-adjusted CAR ONLY; the market-model CAR (beta 250d, min 120, winsorized,
+  size-segmented benchmark) is a post-trigger diagnostic on cards. (S1
+  clarification of the earlier "gate on the more conservative" wording.)
+- Return basis: analytical returns are basis-labeled per row (EXCHANGE_PCT /
+  QFQ_CONSEC / SYNTH_COMPOUND / RAW_CONSEC) with a per-listing basis_epoch;
+  windows mixing raw with adjusted lineage, or mixing epochs, are BLOCKED from
+  analytics. Corporate-action rewrites are detected by overlap checks and bump
+  the epoch. Raw prices remain canonical where sourced (docs/audit/
+  s1-adjudication.md issue 2).
 - PIT peers: industry snapshot per scan date; float-mcap terciles monthly;
   min cell 8 -> broader-industry -> size-only -> market; suspended excluded;
   limit-locked included with LIMIT_CONTAMINATED flag >20%.

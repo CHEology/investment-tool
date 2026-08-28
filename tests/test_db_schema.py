@@ -42,3 +42,8 @@ def test_missing_close_stays_null_not_zero(conn):
         " manifest_id) VALUES('SSE:X','2026-08-28',NULL,'CNY','test','PARTIAL','m1')")
     row = conn.execute("SELECT close FROM security_day WHERE listing_id='SSE:X'").fetchone()
     assert row["close"] is None
+
+
+def test_market_snapshot_table_exists(conn):
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(market_snapshot)").fetchall()}
+    assert {"listing_id", "asof_date", "total_mcap", "float_mcap", "industry", "is_st"} <= cols

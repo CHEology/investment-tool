@@ -70,3 +70,36 @@ def test_frankfurter_parse_preserves_source_token():
     date, rate = frankfurter.parse_rate(payload)
     assert date == "2026-08-27"
     assert rate == "6.7203"  # exact source token, not float repr
+
+
+def test_tencent_parse_volume_lots_to_shares():
+    from investment_tool.providers import tencent
+
+    payload = (b'{"code":0,"msg":"","data":{"sz300274":{"qfqday":['
+               b'["2026-08-28","97.000","97.690","98.880","96.100","616243.000"]]}}}')
+    bars = tencent.parse_kline(payload, "sz300274")
+    assert len(bars) == 1
+    # verified fixture: 300274 on 2026-08-28 traded 616,243 lots = 61,624,300 shares
+    assert bars[0]["volume"] == "61624300"
+    assert bars[0]["close"] == "97.690"  # exact source token
+    assert bars[0]["amount"] is None      # explicitly missing, never zero
+
+
+def test_sina_parse_bse_raw():
+    from investment_tool.providers import sina
+
+    payload = (b'[{"day":"2026-08-28","open":"13.59","high":"13.87","low":"13.44",'
+               b'"close":"13.81","volume":"8133"}]')
+    bars = sina.parse_kline(payload)
+    assert bars[0]["close"] == "13.81" and bars[0]["volume"] == "8133"
+    assert bars[0]["amount"] is None
+
+
+def test_tencent_html_body_yields_no_bars():
+    from investment_tool.providers import tencent
+
+    try:
+        bars = tencent.parse_kline(b"\xef\xbb\xbf<!DOCTYPE html><html></html>", "sz000001")
+    except ValueError:
+        bars = []
+    assert bars == []

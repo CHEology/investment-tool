@@ -75,9 +75,16 @@ CREATE TABLE IF NOT EXISTS alias(
 CREATE TABLE IF NOT EXISTS security_day(
   listing_id TEXT NOT NULL,
   trade_date TEXT NOT NULL,
+  -- Canonical RAW reported prices (NULL when the source serves only adjusted).
   open TEXT, high TEXT, low TEXT, close TEXT, prev_close TEXT,
-  volume TEXT, amount TEXT,
-  pct_chg REAL,
+  volume TEXT,           -- shares (normalized; lot-based sources multiplied out)
+  amount TEXT,           -- turnover in listing currency; NULL if source lacks it
+  -- Analytical primitives: daily return + adjusted close, basis-labeled.
+  ret REAL,              -- daily return fraction; basis per ret_basis
+  ret_basis TEXT,        -- EXCHANGE_PCT | QFQ_CONSEC | SYNTH_COMPOUND | RAW_CONSEC
+  adj_close TEXT,        -- adjusted close (qfq lineage); NULL when unknown
+  basis_epoch INTEGER NOT NULL DEFAULT 1,  -- bumped when adjusted history is rewritten
+  pct_chg REAL,          -- legacy; superseded by ret
   adj_factor TEXT,
   adj_method TEXT NOT NULL DEFAULT 'NONE',
   currency TEXT NOT NULL,
@@ -127,8 +134,11 @@ CREATE TABLE IF NOT EXISTS announcement(
   title TEXT NOT NULL,
   adjunct_url TEXT,
   published_at_utc TEXT,
+  ts_precision TEXT NOT NULL DEFAULT 'DATE',  -- DATE | TIME
+  ts_anomaly TEXT,                            -- e.g. FIRST_SEEN_BEFORE_PUBLISHED
   first_seen_at_utc TEXT NOT NULL,
   category TEXT,
+  relevance TEXT,        -- HARD_NEGATIVE | CONTENT_REVIEW_REQUIRED | POSITIVE | NEUTRAL
   event_id TEXT,
   manifest_id TEXT NOT NULL
 );
@@ -200,13 +210,28 @@ CREATE TABLE IF NOT EXISTS frozen_artifact(
   frozen_at_utc TEXT NOT NULL,
   content_sha256 TEXT NOT NULL,
   path TEXT NOT NULL,
-  config_version TEXT NOT NULL
+  config_version TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'VALID',   -- VALID | SUPERSEDED | INVALIDATED
+  status_note TEXT
 );
 CREATE TABLE IF NOT EXISTS validation_snapshot(
   candidate_id TEXT NOT NULL,
   asof TEXT NOT NULL,
   metrics_json TEXT NOT NULL,
   PRIMARY KEY(candidate_id, asof)
+);
+CREATE TABLE IF NOT EXISTS market_snapshot(
+  listing_id TEXT NOT NULL,
+  asof_date TEXT NOT NULL,
+  name TEXT,
+  total_mcap TEXT,
+  float_mcap TEXT,
+  industry TEXT,
+  is_st INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL,
+  quality TEXT NOT NULL,
+  manifest_id TEXT,
+  PRIMARY KEY(listing_id, asof_date)
 );
 CREATE INDEX IF NOT EXISTS idx_secday_date ON security_day(trade_date);
 CREATE INDEX IF NOT EXISTS idx_ann_code ON announcement(sec_code, published_at_utc);
@@ -224,6 +249,7 @@ def connect(data_dir: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path(data_dir))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(DDL)
     return conn

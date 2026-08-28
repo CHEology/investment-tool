@@ -11,6 +11,7 @@ dependencies = [
     "pyyaml>=6.0",
     "pandas>=2.2",
     "numpy>=1.26",
+    "keyring>=25.0",
 ]
 
 [project.optional-dependencies]

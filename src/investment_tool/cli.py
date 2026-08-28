@@ -14,8 +14,11 @@ from investment_tool.quality import Quality, QualityState
 
 
 def _cfg(conn):
-    cfg = config_mod.load("v0")
-    config_mod.register(conn, cfg, changelog="initial v0 thresholds (all EXPERIMENTAL)")
+    cfg = config_mod.load("v0.1")
+    config_mod.register(
+        conn, cfg,
+        changelog="v0.1: telemetry-only additions; admission thresholds identical to v0",
+    )
     return cfg
 
 
@@ -119,6 +122,165 @@ def cmd_fx(args) -> int:
     return 0
 
 
+def cmd_ingest_eod(args) -> int:
+    from datetime import UTC, datetime
+
+    from investment_tool import spine
+
+    conn = connect()
+    cfg = _cfg(conn)
+    date = args.date or datetime.now(UTC).strftime("%Y-%m-%d")
+    result = spine.ingest_snapshot(conn, cfg.id, date)
+    print(f"snapshot ingest: {result}")
+    return 0 if "error" not in result else 1
+
+
+def cmd_ingest_benchmarks(args) -> int:
+    from investment_tool import spine
+
+    conn = connect()
+    cfg = _cfg(conn)
+    result = spine.ingest_benchmarks(conn, cfg.id, beg=spine.default_beg())
+    print(f"benchmarks: {result}")
+    return 0
+
+
+def cmd_backfill(args) -> int:
+    from investment_tool import spine
+    from investment_tool.providers import sina, tencent
+
+    conn = connect()
+    cfg = _cfg(conn)
+    q = (
+        "SELECT l.listing_id, l.ticker, l.exchange, l.board FROM listing l"
+        " WHERE l.exchange IN ('SSE','SZSE','BSE') AND l.status='LISTED'"
+        " AND l.listing_id IN (SELECT listing_id FROM market_snapshot WHERE"
+        " asof_date=(SELECT MAX(asof_date) FROM market_snapshot))"
+    )
+    params: list = []
+    if args.ticker:
+        q += " AND l.ticker=?"
+        params.append(args.ticker)
+    if args.industry:
+        q += (" AND l.listing_id IN (SELECT listing_id FROM market_snapshot WHERE industry=?"
+              " AND asof_date=(SELECT MAX(asof_date) FROM market_snapshot))")
+        params.append(args.industry)
+    rows = conn.execute(q + " ORDER BY l.ticker", params).fetchall()
+    if args.shard:
+        i, n = (int(x) for x in args.shard.split("/"))
+        rows = [r for idx, r in enumerate(rows) if idx % n == i - 1]
+    if args.limit:
+        rows = rows[: args.limit]
+    if args.skip_existing:
+        have = {
+            r["listing_id"]
+            for r in conn.execute(
+                "SELECT listing_id, COUNT(*) AS n FROM security_day GROUP BY listing_id HAVING n>50"
+            )
+        }
+        rows = [r for r in rows if r["listing_id"] not in have]
+    import time as time_mod
+
+    http_by_provider = {"tencent": tencent.client(), "sina": sina.client()}
+    beg = spine.default_beg()
+    total_bars = 0
+    failures = 0
+    consecutive = 0
+    breaker_trips = 0
+    for i, lst in enumerate(rows, 1):
+        try:
+            bars = spine.backfill_listing(conn, http_by_provider, cfg.id, lst, beg)
+            total_bars += bars
+            if bars > 0:
+                consecutive = 0
+            else:
+                # empty history (delisted/suspended) is data, not provider
+                # unhealth: only count toward the breaker on fetch ERRORs
+                err = conn.execute(
+                    "SELECT quality_state FROM manifest WHERE dataset='kline_daily'"
+                    " ORDER BY retrieved_at_utc DESC LIMIT 1"
+                ).fetchone()
+                consecutive = consecutive + 1 if (err and err["quality_state"] == "ERROR") else 0
+        except Exception as exc:  # noqa: BLE001 - keep the run alive; each failure is manifested
+            failures += 1
+            consecutive += 1
+            print(f"  ! {lst['ticker']}: {exc}")
+        if consecutive >= 8:
+            # circuit breaker: sustained failures mean the provider is refusing
+            # us — cool down once, then stop safely (resume via --skip-existing).
+            breaker_trips += 1
+            if breaker_trips >= 2:
+                print(f"circuit breaker: aborting at {i}/{len(rows)};"
+                      " resume later with --skip-existing")
+                break
+            print("circuit breaker: 8 consecutive empty/failed; cooling down 120s")
+            time_mod.sleep(120)
+            consecutive = 0
+        if i % 250 == 0:
+            print(f"  backfill progress: {i}/{len(rows)} listings, {total_bars} bars")
+    q = conn.execute(
+        "SELECT provider, quality_state, COUNT(*) AS n FROM manifest"
+        " WHERE dataset='kline_daily' GROUP BY 1,2"
+    ).fetchall()
+    print("provider health:", [(r["provider"], r["quality_state"], r["n"]) for r in q])
+    print(f"backfill done: {len(rows)} listings, {total_bars} bars, {failures} failures,"
+          f" breaker_trips={breaker_trips}")
+    return 0
+
+
+def cmd_scan(args) -> int:
+    import json as json_mod
+
+    from investment_tool import cards as cards_mod
+    from investment_tool import lane_a
+
+    conn = connect()
+    cfg = _cfg(conn)
+    audit = lane_a.run_scan(conn, cfg, args.date)
+    if "error" in audit:
+        print(f"scan aborted: {audit['error']}")
+        return 1
+    # freeze cards for exactly the candidates this scan touched (assessed states)
+    touched = audit.get("touched_candidates") or []
+    rows = []
+    if touched:
+        marks = ",".join("?" for _ in touched)
+        rows = conn.execute(
+            f"SELECT * FROM candidate WHERE candidate_id IN ({marks})"  # noqa: S608
+            " AND state NOT IN ('PENDING_ATTRIBUTION','ATTRIBUTION_FETCH_DEGRADED')",
+            touched,
+        ).fetchall()
+    for r in rows:
+        content = cards_mod.render_card_zh(conn, r)
+        frozen = cards_mod.freeze_card(conn, r, content)
+        print(f"card frozen: {r['state']} -> {frozen['path']} (sha {frozen['sha256'][:12]})")
+    print(json_mod.dumps({k: v for k, v in audit.items() if k != "trigger_detail"},
+                         ensure_ascii=False, indent=2, default=str))
+    print(f"trigger detail: {len(audit.get('trigger_detail', []))} rows (see audit file)")
+    return 0
+
+
+def cmd_credentials(args) -> int:
+    """Store a provider token in the macOS Keychain via hidden interactive
+    input. The token never appears in shell history, process listings, logs,
+    fixtures, or manifests (review issue 3)."""
+    import getpass
+
+    try:
+        import keyring
+    except ImportError:
+        print("keyring package missing; run: uv pip install -e '.[dev]'")
+        return 1
+    service = f"investment-tool-{args.provider}"
+    token = getpass.getpass(f"Token for {service} (input hidden): ")
+    if not token.strip():
+        print("empty token; nothing stored")
+        return 1
+    keyring.set_password(service, getpass.getuser(), token.strip())
+    print(f"stored in Keychain service '{service}' (account {getpass.getuser()})")
+    return 0
+
+
 def cmd_status(args) -> int:
     conn = connect()
     for table in ("company", "listing", "manifest", "security_day", "announcement",
@@ -148,6 +310,31 @@ def build_parser() -> argparse.ArgumentParser:
     f = sub.add_parser("fx", help="fetch and store the ECB USD/CNY reference rate")
     f.add_argument("--date", default=None, help="YYYY-MM-DD (default: latest)")
     f.set_defaults(func=cmd_fx)
+
+    ie = sub.add_parser(
+        "ingest-eod", help="ingest today's A-share EOD snapshot (Eastmoney PROVISIONAL)"
+    )
+    ie.add_argument("--date", default=None, help="asof date label (default: today UTC)")
+    ie.set_defaults(func=cmd_ingest_eod)
+
+    ib = sub.add_parser("ingest-benchmarks", help="ingest benchmark index history + CN calendar")
+    ib.set_defaults(func=cmd_ingest_benchmarks)
+
+    bf = sub.add_parser("backfill", help="backfill daily bars per listing (Eastmoney PROVISIONAL)")
+    bf.add_argument("--ticker", default=None)
+    bf.add_argument("--industry", default=None, help="restrict to one snapshot industry")
+    bf.add_argument("--shard", default=None, help="i/n parallel shard, e.g. 2/4")
+    bf.add_argument("--limit", type=int, default=None)
+    bf.add_argument("--skip-existing", action="store_true")
+    bf.set_defaults(func=cmd_backfill)
+
+    sc = sub.add_parser("scan", help="run the Lane A daily scan for a date (frozen v0 rules)")
+    sc.add_argument("--date", required=True, help="scan/trading date YYYY-MM-DD")
+    sc.set_defaults(func=cmd_scan)
+
+    cr = sub.add_parser("credentials", help="store a provider token via hidden input (Keychain)")
+    cr.add_argument("provider", choices=["tushare", "eodhd"])
+    cr.set_defaults(func=cmd_credentials)
 
     st = sub.add_parser("status", help="table counts and manifest quality summary")
     st.set_defaults(func=cmd_status)
