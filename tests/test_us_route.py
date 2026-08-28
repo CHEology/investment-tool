@@ -102,3 +102,43 @@ def test_eligible_session_us():
     assert r["eligible_from_date"] == "2026-08-28" and r["same_session_partial"] is False
     r = us_route.eligible_session_us(None, "2026-08-27")
     assert r["precision"] == "DATE"
+
+
+def test_staged_classification_8k_without_items_stays_pending(conn):
+    from investment_tool import us_ingest, us_route
+
+    us_ingest.ingest_daily_index(conn, (FIX / "master_sample.idx").read_bytes(),
+                                 "2026-08-27", "m_idx")
+    hist = us_route.route_unclassified(conn)
+    # no items enrichment yet: all four 8-K/8-K/A rows pend; nothing neutralized
+    assert hist["PENDING_ITEMS"] == 4
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sec_filing WHERE form LIKE '8-K%'"
+        " AND classification_version IS NOT NULL").fetchone()[0] == 0
+    # enrichment arrives -> re-route classifies the material filings
+    us_ingest.enrich_items_from_efts(conn, (FIX / "efts_8k_sample.json").read_bytes())
+    hist2 = us_route.route_unclassified(conn)
+    assert hist2.get("EVENT", 0) >= 2  # 4.02 and 1.03 8-Ks become HARD events
+    events = {r["type"] for r in conn.execute("SELECT type FROM event")}
+    assert "NON_RELIANCE" in events and "BANKRUPTCY" in events
+
+
+def test_late_enrichment_reclassifies_previously_neutral_8k(conn):
+    """Regression for the silent-neutralization defect: a legacy row classified
+    while items were unknown must be re-routed when items arrive."""
+    from investment_tool import us_ingest, us_route
+
+    us_ingest.ingest_daily_index(conn, (FIX / "master_sample.idx").read_bytes(),
+                                 "2026-08-27", "m_idx")
+    # simulate the pre-fix state: force-classify one 8-K as neutral observation
+    conn.execute("UPDATE sec_filing SET classification_version='us_v1', relevance='NEUTRAL'"
+                 " WHERE accession='0001000002-26-000201'")
+    conn.commit()
+    us_ingest.enrich_items_from_efts(conn, (FIX / "efts_8k_sample.json").read_bytes())
+    row = conn.execute("SELECT classification_version FROM sec_filing"
+                       " WHERE accession='0001000002-26-000201'").fetchone()
+    assert row["classification_version"] is None  # cleared for re-routing
+    us_route.route_unclassified(conn)
+    row = conn.execute("SELECT relevance, event_id FROM sec_filing"
+                       " WHERE accession='0001000002-26-000201'").fetchone()
+    assert row["relevance"] == "HARD_NEGATIVE" and row["event_id"] is not None

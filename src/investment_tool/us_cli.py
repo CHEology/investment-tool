@@ -53,34 +53,90 @@ def run_us_map(conn, cfg, fixture: str | None) -> dict:
     return audit
 
 
+def _fetch_manifested(conn, cfg, http, url: str, provider: str, dataset: str,
+                      params: dict):
+    resp = http.get(url)
+    quality = Quality(
+        QualityState.OK if resp.status_code == 200 else QualityState.ERROR,
+        f"http={resp.status_code}",
+    )
+    m = record_fetch(
+        conn, provider=provider, dataset=dataset, params=params, source_url=url,
+        payload=resp.content, http_status=resp.status_code, quality=quality,
+        config_version=cfg.id,
+    )
+    return resp, m
+
+
+def _live_efts_items(conn, cfg, http, date: str, audit: dict) -> None:
+    """Items batch for the day's 8-Ks: paginated efts query (verified to
+    reconcile with the daily index within ~2%)."""
+    total = 0
+    for start in range(0, 1000, 100):
+        url = (f"{sec.EFTS_URL}?q=&forms=8-K&dateRange=custom&startdt={date}&enddt={date}"
+               f"&from={start}")
+        resp, _m = _fetch_manifested(conn, cfg, http, url, "sec", "efts_items",
+                                     {"date": date, "from": start})
+        if resp.status_code != 200:
+            audit["channels"]["efts_items_error"] = f"http={resp.status_code} at from={start}"
+            break
+        total += us_ingest.enrich_items_from_efts(conn, resp.content)
+        import json as json_mod
+
+        page = len(json_mod.loads(resp.content.decode("utf-8"))
+                   .get("hits", {}).get("hits", []))
+        if page < 100:
+            break
+    audit["channels"]["efts_items"] = total
+
+
+def _live_submissions_enrichment(conn, cfg, http, date: str, cap: int, audit: dict) -> None:
+    """Acceptance/reportDate enrichment for filers whose filings can create or
+    amend events — bounded, targeted, never universe-wide."""
+    ciks = [r["cik"] for r in conn.execute(
+        "SELECT DISTINCT cik FROM sec_filing WHERE filing_date=?"
+        " AND (form LIKE '8-K%' OR form LIKE 'NT %' OR form IN ('25','25-NSE')"
+        "      OR form LIKE 'SC 13D%' OR is_amendment=1)"
+        " AND accepted_at_utc IS NULL LIMIT ?", (date, cap),
+    )]
+    done = 0
+    for cik in ciks:
+        url = sec.SUBMISSIONS_URL.format(cik10=str(cik).zfill(10))
+        resp, _m = _fetch_manifested(conn, cfg, http, url, "sec", "submissions",
+                                     {"cik": cik})
+        if resp.status_code == 200:
+            us_ingest.enrich_from_submissions(conn, resp.content)
+            done += 1
+    audit["channels"]["submissions"] = {"filers_fetched": done, "cap": cap,
+                                        "eligible": len(ciks)}
+
+
 def run_us_sync(conn, cfg, date: str, index_fixture: str | None,
                 efts_fixture: str | None, submissions_fixtures: list[str],
-                getcurrent_fixture: str | None) -> dict:
+                getcurrent_fixture: str | None, submissions_cap: int = 40) -> dict:
+    """One pipeline for fixture and live modes: discover -> enrich -> route.
+    Routing always runs AFTER enrichment; 8-Ks without items stay PENDING_ITEMS
+    rather than degrading to neutral observations (staged classification)."""
     audit: dict = {"date": date, "generated_at": utc_now(), "config_version": cfg.id,
                    "channels": {}, "us_completeness": "PENDING_EVENING_INDEX"}
+    fixture_mode = any([index_fixture, efts_fixture, submissions_fixtures,
+                        getcurrent_fixture])
+    http = None if fixture_mode else sec.client()  # identity gate up front in live mode
+
     if getcurrent_fixture:
         payload = Path(getcurrent_fixture).read_bytes()
         audit["channels"]["getcurrent"] = us_ingest.poll_getcurrent(conn, payload, "fixture")
+
     if index_fixture:
-        payload = Path(index_fixture).read_bytes()
-        result = us_ingest.ingest_daily_index(conn, payload, date, "fixture")
+        result = us_ingest.ingest_daily_index(
+            conn, Path(index_fixture).read_bytes(), date, "fixture")
         audit["channels"]["daily_index"] = result
         audit["us_completeness"] = result["us_completeness"]
-    elif not getcurrent_fixture:
-        # live mode: identity-gated fetch of the day's master index
-        http = sec.client()
+    elif not fixture_mode:
         y, q = date[:4], (int(date[5:7]) + 2) // 3
         url = sec.DAILY_INDEX_URL.format(year=y, q=q, ymd=date.replace("-", ""))
-        resp = http.get(url)
-        quality = Quality(
-            QualityState.OK if resp.status_code == 200 else QualityState.ERROR,
-            f"http={resp.status_code}",
-        )
-        m = record_fetch(
-            conn, provider="sec", dataset="daily_index", params={"date": date},
-            source_url=url, payload=resp.content, http_status=resp.status_code,
-            quality=quality, config_version=cfg.id,
-        )
+        resp, m = _fetch_manifested(conn, cfg, http, url, "sec", "daily_index",
+                                    {"date": date})
         if resp.status_code == 200:
             result = us_ingest.ingest_daily_index(conn, resp.content, date, m.manifest_id)
             audit["channels"]["daily_index"] = result
@@ -90,13 +146,20 @@ def run_us_sync(conn, cfg, date: str, index_fixture: str | None,
                 "error": f"http={resp.status_code}",
                 "note": "index may not exist yet (evening artifact)",
             }
+
+    # enrichment BEFORE routing, in both modes
     if efts_fixture:
         audit["channels"]["efts_items"] = us_ingest.enrich_items_from_efts(
             conn, Path(efts_fixture).read_bytes())
+    elif not fixture_mode and "error" not in audit["channels"].get("daily_index", {}):
+        _live_efts_items(conn, cfg, http, date, audit)
     for sf in submissions_fixtures:
-        audit.setdefault("channels", {}).setdefault("submissions", 0)
+        audit["channels"].setdefault("submissions", 0)
         audit["channels"]["submissions"] += us_ingest.enrich_from_submissions(
             conn, Path(sf).read_bytes())
+    if not fixture_mode and "error" not in audit["channels"].get("daily_index", {}):
+        _live_submissions_enrichment(conn, cfg, http, date, submissions_cap, audit)
+
     audit["routing"] = us_route.route_unclassified(conn)
     audit["amendments"] = us_route.link_amendments(conn)
     conn.execute(
@@ -105,6 +168,9 @@ def run_us_sync(conn, cfg, date: str, index_fixture: str | None,
     conn.commit()
     audit["review_queue_pending"] = conn.execute(
         "SELECT COUNT(*) FROM sec_filing WHERE review_state='PENDING'").fetchone()[0]
+    audit["pending_items_8k"] = conn.execute(
+        "SELECT COUNT(*) FROM sec_filing WHERE classification_version IS NULL"
+        " AND form LIKE '8-K%'").fetchone()[0]
     _audit_write(f"us_sync_{date}", audit)
     return audit
 

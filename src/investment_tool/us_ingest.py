@@ -74,7 +74,7 @@ def ingest_daily_index(conn: sqlite3.Connection, payload: bytes, index_date: str
         conn.rollback()
         raise
     return {"index_date": index_date, "total_rows": len(rows), "normalized": kept,
-            "us_completeness": f"COMPLETE({index_date})"}
+            "us_completeness": f"INDEX_RECONCILED_AS_OF({index_date})"}
 
 
 def poll_getcurrent(conn: sqlite3.Connection, payload: bytes, manifest_id: str) -> dict:
@@ -98,6 +98,19 @@ def poll_getcurrent(conn: sqlite3.Connection, payload: bytes, manifest_id: str) 
     return {"entries": len(entries), "normalized": kept, "us_completeness": "PENDING_EVENING_INDEX"}
 
 
+def _reclassify_if_item_arrived(conn: sqlite3.Connection, accession: str) -> None:
+    """A row classified while items were unknown could only have been routed
+    NEUTRAL/OBSERVATION (no event). When items arrive later, clear the
+    classification so deterministic re-routing runs. Rows classified WITH
+    items never change (enrichment fills NULLs only)."""
+    conn.execute(
+        "UPDATE sec_filing SET classification_version=NULL, relevance=NULL, event_id=NULL"
+        " WHERE accession=? AND items_csv IS NOT NULL AND classification_version IS NOT NULL"
+        " AND event_id IS NULL AND form LIKE '8-K%'",
+        (accession,),
+    )
+
+
 def enrich_items_from_efts(conn: sqlite3.Connection, payload: bytes) -> int:
     items_by_acc = sec.parse_efts_items(payload)
     n = 0
@@ -106,6 +119,8 @@ def enrich_items_from_efts(conn: sqlite3.Connection, payload: bytes) -> int:
             "UPDATE sec_filing SET items_csv=COALESCE(items_csv, ?) WHERE accession=?",
             (",".join(rec["items"]) if rec["items"] else None, acc),
         )
+        if cur.rowcount:
+            _reclassify_if_item_arrived(conn, acc)
         n += cur.rowcount
     conn.commit()
     return n
@@ -134,6 +149,8 @@ def enrich_from_submissions(conn: sqlite3.Connection, payload: bytes) -> int:
                 acc,
             ),
         )
+        if cur.rowcount:
+            _reclassify_if_item_arrived(conn, acc)
         n += cur.rowcount
     conn.commit()
     return n

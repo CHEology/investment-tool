@@ -20,7 +20,7 @@ def test_daily_index_normalizes_allowlist_only(conn):
     forms = {r["form"] for r in conn.execute("SELECT form FROM sec_filing")}
     assert "NPORT-P" not in forms and "424B2" not in forms
     assert {"8-K", "8-K/A", "NT 10-K", "6-K", "SC 13D", "4", "10-Q"} <= forms
-    assert result["us_completeness"] == "COMPLETE(2026-08-27)"
+    assert result["us_completeness"] == "INDEX_RECONCILED_AS_OF(2026-08-27)"
 
 
 def test_idempotent_reingest_preserves_first_seen(conn):

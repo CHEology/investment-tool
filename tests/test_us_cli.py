@@ -33,7 +33,7 @@ def test_us_sync_fixture_pipeline_and_review(conn, tmp_path, monkeypatch):
         str(FIX / "master_sample.idx"), str(FIX / "efts_8k_sample.json"),
         [str(FIX / "submissions_sample.json")], str(FIX / "getcurrent_sample.atom"),
     )
-    assert audit["us_completeness"] == "COMPLETE(2026-08-27)"
+    assert audit["us_completeness"] == "INDEX_RECONCILED_AS_OF(2026-08-27)"
     assert audit["routing"]["EVENT"] >= 3
     assert audit["review_queue_pending"] >= 2
     review = us_cli.run_review(conn, cfg)

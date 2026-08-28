@@ -380,7 +380,8 @@ def cmd_us_sync(args) -> int:
     conn = connect()
     cfg = _cfg(conn)
     audit = us_cli.run_us_sync(conn, cfg, args.date, args.index_fixture, args.efts_fixture,
-                               args.submissions_fixture or [], args.getcurrent_fixture)
+                               args.submissions_fixture or [], args.getcurrent_fixture,
+                               submissions_cap=args.submissions_cap)
     print(json_mod.dumps(audit, ensure_ascii=False, indent=2, default=str))
     degraded = any(isinstance(v, dict) and "error" in v
                    for v in audit.get("channels", {}).values())
@@ -515,6 +516,8 @@ def build_parser() -> argparse.ArgumentParser:
     us.add_argument("--efts-fixture", default=None)
     us.add_argument("--submissions-fixture", action="append", default=None)
     us.add_argument("--getcurrent-fixture", default=None)
+    us.add_argument("--submissions-cap", type=int, default=40,
+                    help="max targeted submissions fetches per live sync")
     us.set_defaults(func=cmd_us_sync)
 
     ha = sub.add_parser("halts", help="poll Nasdaq trade-halts RSS (observation/event routing)")

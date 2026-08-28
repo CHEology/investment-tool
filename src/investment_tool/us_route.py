@@ -74,6 +74,13 @@ def route_unclassified(conn: sqlite3.Connection) -> dict:
     ).fetchall()
     hist: dict[str, int] = {}
     for f in rows:
+        base = f["form"][:-2] if f["form"].endswith("/A") else f["form"]
+        if base == "8-K" and f["items_csv"] is None:
+            # Staged classification: an 8-K without item codes is NOT neutral —
+            # it is unclassifiable. It stays pending until enrichment arrives
+            # (a silently-neutral material 8-K was the failure mode here).
+            hist["PENDING_ITEMS"] = hist.get("PENDING_ITEMS", 0) + 1
+            continue
         relevance, event_type, action = classify(f["form"], f["items_csv"])
         hist[action] = hist.get(action, 0) + 1
         event_id = None
