@@ -109,3 +109,55 @@ def test_peer_membership_is_point_in_time(conn, tmp_path, monkeypatch):
     snap = json.loads(conn.execute(
         "SELECT metrics_json FROM validation_snapshot").fetchone()["metrics_json"])
     assert snap["ret_peer_adj"] is not None  # pre-freeze membership still used
+
+
+def _snapshot_row(conn, lid, asof, industry):
+    conn.execute("INSERT OR REPLACE INTO market_snapshot(listing_id, asof_date, industry,"
+                 " is_st, source, quality) VALUES(?,?,?,0,'test','PROVISIONAL')",
+                 (lid, asof, industry))
+
+
+def test_peer_joining_industry_after_ref_date_is_excluded(conn):
+    _seed(conn, "2026-08-01T16:00:00Z", n_days=20)
+    # a third company joins 测试行业 only AFTER the reference date
+    conn.execute("INSERT INTO company(company_id, created_asof)"
+                 " VALUES('CN:000903','2026-01-01T00:00:00Z')")
+    conn.execute("INSERT INTO listing(listing_id, company_id, ticker, exchange, board,"
+                 " currency) VALUES('SZSE:000903','CN:000903','000903','SZSE','MAIN','CNY')")
+    _snapshot_row(conn, "SZSE:000903", "2026-08-20", "测试行业")
+    conn.commit()
+    from investment_tool.validate import _cell_members
+    members = _cell_members(conn, "SZSE:000900", "2026-08-03")
+    assert "SZSE:000903" not in members
+    assert set(members) == {"SZSE:000901", "SZSE:000902"}
+
+
+def test_peer_leaving_industry_before_ref_date_is_excluded(conn):
+    _seed(conn, "2026-08-01T16:00:00Z", n_days=20)
+    # 000901 was reclassified OUT of the cell before the reference date
+    _snapshot_row(conn, "SZSE:000901", "2026-08-02", "别的行业")
+    conn.commit()
+    from investment_tool.validate import _cell_members
+    members = _cell_members(conn, "SZSE:000900", "2026-08-03")
+    assert members == ["SZSE:000902"]
+
+
+def test_missing_pre_reference_snapshot_means_no_membership(conn):
+    _seed(conn, "2026-08-01T16:00:00Z", n_days=20)
+    from investment_tool.validate import _cell_members
+    # snapshots exist only at 2026-08-01; a ref date before that -> no basis
+    assert _cell_members(conn, "SZSE:000900", "2026-07-15") == []
+
+
+def test_peer_with_mismatched_endpoint_is_skipped(conn):
+    _seed(conn, "2026-08-01T16:00:00Z", n_days=20)
+    # peer 000901 stops trading five sessions early -> endpoint mismatch
+    conn.execute("DELETE FROM security_day WHERE listing_id='SZSE:000901'"
+                 " AND trade_date>'2026-08-16'")
+    conn.commit()
+    validate.run_validation(conn, asof="2026-08-28")
+    import json
+    snap = json.loads(conn.execute(
+        "SELECT metrics_json FROM validation_snapshot").fetchone()["metrics_json"])
+    assert snap["peers_skipped_endpoint_mismatch"] == 1
+    assert snap["ret_peer_adj"] is None  # only one comparable peer left

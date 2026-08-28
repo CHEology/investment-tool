@@ -56,25 +56,32 @@ def _adj_series(conn, listing_id: str, start: str, end: str) -> pd.Series:
     ).dropna()
 
 
-def _cell_members(conn, listing_id: str, ref_date: str) -> list[str]:
-    """Peer membership as of the tracking start: the latest snapshot at or
-    before ref_date (falling back to the earliest available), so later
-    industry reclassifications cannot leak into an already-started track."""
+def _industry_asof(conn, listing_id: str, ref_date: str) -> str | None:
     row = conn.execute(
         "SELECT industry FROM market_snapshot WHERE listing_id=? AND asof_date<=?"
         " ORDER BY asof_date DESC LIMIT 1", (listing_id, ref_date),
     ).fetchone()
-    if row is None:
-        row = conn.execute(
-            "SELECT industry FROM market_snapshot WHERE listing_id=?"
-            " ORDER BY asof_date ASC LIMIT 1", (listing_id,),
-        ).fetchone()
-    if row is None or row["industry"] is None:
+    return row["industry"] if row else None
+
+
+def _cell_members(conn, listing_id: str, ref_date: str) -> list[str]:
+    """True point-in-time membership: the candidate AND every peer are
+    classified by their own latest snapshot at or before ref_date. No
+    fall-forward — a company without a pre-reference snapshot (or one that
+    joined the industry only later) is simply not a peer for this track."""
+    industry = _industry_asof(conn, listing_id, ref_date)
+    if industry is None:
         return []
     return [
         r["listing_id"] for r in conn.execute(
-            "SELECT DISTINCT listing_id FROM market_snapshot WHERE industry=?"
-            " AND listing_id != ?", (row["industry"], listing_id),
+            """
+            SELECT ms.listing_id FROM market_snapshot ms
+            JOIN (SELECT listing_id, MAX(asof_date) AS d FROM market_snapshot
+                  WHERE asof_date<=? GROUP BY listing_id) latest
+              ON latest.listing_id=ms.listing_id AND latest.d=ms.asof_date
+            WHERE ms.industry=? AND ms.listing_id != ?
+            """,
+            (ref_date, industry, listing_id),
         )
     ]
 
@@ -107,16 +114,22 @@ def _snapshot_for(conn, cand: sqlite3.Row, asof: str) -> dict:
     peers = _cell_members(conn, lid, ref_date)
     peer_final = None
     peers_skipped_baseline = 0
+    peers_skipped_endpoint = 0
+    end_date = str(series.index[-1])
     if len(peers) >= 2:
         finals = []
         for p in peers:
             s = _adj_series(conn, p, ref_date, asof)
-            # comparable dates: a peer must share the candidate's exact
-            # baseline session, else its cumulative return is not comparable
+            # comparable windows: a peer must share the candidate's exact
+            # baseline session AND final session, else its cumulative return
+            # covers a different period and is not comparable
             if len(s) == 0 or str(s.index[0]) != ref_date:
                 peers_skipped_baseline += 1
                 continue
-            if len(s) >= len(series) // 2 and s.iloc[0] > 0:
+            if str(s.index[-1]) != end_date:
+                peers_skipped_endpoint += 1
+                continue
+            if s.iloc[0] > 0:
                 finals.append(float(s.iloc[-1] / s.iloc[0] - 1.0))
         if len(finals) >= 2:
             peer_final = float(pd.Series(finals).median())
@@ -133,6 +146,7 @@ def _snapshot_for(conn, cand: sqlite3.Row, asof: str) -> dict:
         "peer_median_ret": peer_final,
         "mae_raw": float(cum.min()),
         "peers_skipped_baseline_mismatch": peers_skipped_baseline,
+        "peers_skipped_endpoint_mismatch": peers_skipped_endpoint,
     }
     for w in WINDOWS:
         out[f"ret_raw_{w}s"] = float(cum.iloc[w]) if len(cum) > w else None
