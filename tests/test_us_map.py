@@ -75,6 +75,10 @@ def test_reconcile_states_and_enrichment(conn):
 def test_user_agent_gate_rejects_placeholder(monkeypatch):
     import pytest
 
+    # isolate from the host Keychain: the gate's fallback must see nothing
+    import keyring
+
+    monkeypatch.setattr(keyring, "get_password", lambda *a, **k: None)
     monkeypatch.setenv("SEC_USER_AGENT", "Research contact@example.com")
     with pytest.raises(sec.SecConfigError):
         sec.require_user_agent()
