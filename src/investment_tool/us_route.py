@@ -55,13 +55,37 @@ def classify(form: str, items_csv: str | None) -> tuple[str, str | None, str]:
 
 
 def _independence(roles: set[str], event_concerns_subject: bool) -> tuple[int, str]:
-    if event_concerns_subject and "FILER" in roles:
-        return 2, "third-party filer about subject company"
+    if event_concerns_subject and "FILER" in roles and "SUBJECT" in roles:
+        return 2, ("independent for the filer's OWN ownership/stake/intent claim;"
+                   " NOT for claims about the subject company's operations")
     if "INSIDER" in roles:
         return 1, "issuer-adjacent insider"
-    if roles == {"UNKNOWN_INDEX"} or not roles:
+    if roles <= {"UNKNOWN_INDEX"} or not roles:
         return 0, "PARTY_ROLES_UNRESOLVED (conservative floor)"
     return 0, "issuer-primary"
+
+
+def resolve_subject_roles(conn: sqlite3.Connection, accession: str) -> str | None:
+    """Subject-form filings are indexed under both the reporting person and the
+    subject issuer. With exactly two known parties and one FILER (e.g. from the
+    getcurrent '(Filed by)' hint), the other is deterministically the SUBJECT.
+    Anything else stays unresolved — never guessed."""
+    parties = conn.execute(
+        "SELECT cik, role FROM filing_party WHERE accession=?", (accession,)
+    ).fetchall()
+    subject = next((p["cik"] for p in parties if p["role"] == "SUBJECT"), None)
+    if subject:
+        return subject
+    ciks = {p["cik"] for p in parties}
+    filers = {p["cik"] for p in parties if p["role"] == "FILER"}
+    if len(ciks) == 2 and len(filers) == 1:
+        subject = next(iter(ciks - filers))
+        conn.execute(
+            "UPDATE filing_party SET role='SUBJECT' WHERE accession=? AND cik=?"
+            " AND role='UNKNOWN_INDEX'", (accession, subject),
+        )
+        return subject
+    return None
 
 
 def _event_id(accession: str, event_type: str) -> str:
@@ -107,13 +131,16 @@ def _create_event(conn, filing: sqlite3.Row, event_type: str, relevance: str) ->
         (event_id, event_type, published, filing["first_seen_at_utc"],
          "A" if relevance == "HARD_NEGATIVE" else "A/B"),
     )
+    subjectish = event_type == "STAKE_ACTIVIST"
+    subject_cik = resolve_subject_roles(conn, filing["accession"]) if subjectish else None
     roles = {
         r["role"] for r in conn.execute(
             "SELECT role FROM filing_party WHERE accession=?", (filing["accession"],)
         )
     }
-    subjectish = event_type == "STAKE_ACTIVIST"
     indep, indep_note = _independence(roles, subjectish)
+    if subjectish and subject_cik is None:
+        indep_note += "; SUBJECT_UNRESOLVED (no company linked)"
     dims = {"authority": 2, "independence": indep, "directness": 3, "specificity": 2,
             "bindingness": 0, "reproducibility": 1, "freshness": 2}
     conn.execute(
@@ -128,11 +155,16 @@ def _create_event(conn, filing: sqlite3.Row, event_type: str, relevance: str) ->
             json.dumps(dims),
         ),
     )
-    # company linkage where the CIK resolves (issuer forms); unresolved stays visible
-    company = conn.execute(
-        "SELECT c.company_id FROM company c JOIN listing l ON l.company_id=c.company_id"
-        " WHERE c.cik=? LIMIT 1", (filing["cik"],),
-    ).fetchone()
+    # Company linkage: subject-form events belong to the SUBJECT company, never
+    # to whichever index row arrived first; issuer forms link the filing CIK.
+    # Unresolved subjects stay unlinked and visible.
+    link_cik = subject_cik if subjectish else filing["cik"]
+    company = None
+    if link_cik is not None:
+        company = conn.execute(
+            "SELECT c.company_id FROM company c JOIN listing l ON l.company_id=c.company_id"
+            " WHERE c.cik=? ORDER BY c.company_id LIMIT 1", (link_cik,),
+        ).fetchone()
     if company:
         conn.execute(
             "INSERT OR IGNORE INTO event_company(event_id, company_id) VALUES(?,?)",
@@ -182,20 +214,39 @@ def link_amendments(conn: sqlite3.Connection) -> dict:
     return hist
 
 
+def _next_weekday(d):
+    d = d + timedelta(days=1)
+    while d.weekday() >= 5:
+        d = d + timedelta(days=1)
+    return d
+
+
 def eligible_session_us(accepted_at_utc: str | None, filing_date: str | None) -> dict:
-    """US temporal eligibility from acceptance time (second precision when
-    enriched). RTH acceptance -> same ET session (t0_partial); after-hours ->
-    next calendar day (session resolution against a US calendar arrives with
-    the price slice). Date-only fallback carries explicit DATE precision."""
+    """US temporal eligibility from acceptance time, in real America/New_York
+    time (DST-correct via zoneinfo — never a hard-coded offset). Weekends roll
+    to the next weekday. US holidays and early closes are NOT yet modeled
+    (explicit session_calendar flag); a true session calendar arrives with the
+    US price slice. Replay visibility remains governed by first_seen_at_utc.
+    Same-session eligibility is flagged partial and must never be mixed with
+    full-session return windows."""
+    from zoneinfo import ZoneInfo
+
+    calendar_note = "WEEKDAY_APPROX_NO_HOLIDAYS"
     if accepted_at_utc:
         dt = datetime.strptime(accepted_at_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-        et = dt - timedelta(hours=4)  # EDT; refined with a proper tz map at the price slice
+        et = dt.astimezone(ZoneInfo("America/New_York"))
+        if et.weekday() >= 5:
+            d = _next_weekday(et.date())
+            return {"eligible_from_date": d.isoformat(), "precision": "TIME",
+                    "same_session_partial": False, "session_calendar": calendar_note}
         if et.hour < 16:
-            return {"eligible_from_date": et.strftime("%Y-%m-%d"), "precision": "TIME",
-                    "same_session_partial": True}
-        return {"eligible_from_date": (et + timedelta(days=1)).strftime("%Y-%m-%d"),
-                "precision": "TIME", "same_session_partial": False}
+            return {"eligible_from_date": et.date().isoformat(), "precision": "TIME",
+                    "same_session_partial": True, "session_calendar": calendar_note}
+        return {"eligible_from_date": _next_weekday(et.date()).isoformat(),
+                "precision": "TIME", "same_session_partial": False,
+                "session_calendar": calendar_note}
     if filing_date:
         return {"eligible_from_date": filing_date, "precision": "DATE",
-                "same_session_partial": None}
-    return {"eligible_from_date": None, "precision": "UNKNOWN", "same_session_partial": None}
+                "same_session_partial": None, "session_calendar": calendar_note}
+    return {"eligible_from_date": None, "precision": "UNKNOWN",
+            "same_session_partial": None, "session_calendar": calendar_note}

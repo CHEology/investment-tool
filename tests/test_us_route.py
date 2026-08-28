@@ -55,17 +55,20 @@ def test_independence_role_derived(conn):
         " ON ev.event_id=f.event_id WHERE f.form='SC 13D'").fetchone()
     assert json.loads(ev13d["dims_json"])["independence"] == 0
     assert "PARTY_ROLES_UNRESOLVED" in ev13d["excerpt"]
-    # with a FILER role hint (atom channel), a subject-stake event reaches 2
-    conn.execute("INSERT OR IGNORE INTO filing_party(accession, cik, role)"
-                 " VALUES('0001000004-26-000401','1000004','FILER')")
+    # a FILER hint alone (no resolved SUBJECT) still floors at 0 under the
+    # corrected model: independence 2 needs BOTH roles resolved (see
+    # test_13d_event_links_subject_not_filer for the resolved case)
+    conn.execute("UPDATE filing_party SET role='FILER'"
+                 " WHERE accession='0001000004-26-000401' AND cik='1000004'")
     conn.execute("DELETE FROM evidence WHERE evidence_id='evd_us_0001000004-26-000401'")
     conn.execute("UPDATE sec_filing SET classification_version=NULL, event_id=NULL"
                  " WHERE accession='0001000004-26-000401'")
     conn.commit()
     us_route.route_unclassified(conn)
-    ev = conn.execute("SELECT dims_json FROM evidence"
+    ev = conn.execute("SELECT dims_json, excerpt FROM evidence"
                       " WHERE evidence_id='evd_us_0001000004-26-000401'").fetchone()
-    assert json.loads(ev["dims_json"])["independence"] == 2
+    assert json.loads(ev["dims_json"])["independence"] == 0
+    assert "SUBJECT_UNRESOLVED" in ev["excerpt"]
 
 
 def test_amendment_linkage_states(conn):
@@ -95,13 +98,26 @@ def test_amendment_ambiguous_when_two_originals_share_period(conn):
     assert hist["AMBIGUOUS"] == 1
 
 
-def test_eligible_session_us():
-    r = us_route.eligible_session_us("2026-08-27T18:02:11Z", None)  # 14:02 ET -> same session
+def test_eligible_session_us_dst_and_weekends():
+    # EDT (summer, UTC-4): 18:02Z = 14:02 ET -> same session, partial
+    r = us_route.eligible_session_us("2026-08-27T18:02:11Z", None)
     assert r["eligible_from_date"] == "2026-08-27" and r["same_session_partial"] is True
-    r = us_route.eligible_session_us("2026-08-27T21:30:00Z", None)  # 17:30 ET -> next day
+    # EDT after-hours: 21:30Z = 17:30 ET Thursday -> Friday
+    r = us_route.eligible_session_us("2026-08-27T21:30:00Z", None)
     assert r["eligible_from_date"] == "2026-08-28" and r["same_session_partial"] is False
+    # EST (winter, UTC-5): 20:30Z = 15:30 EST -> SAME session (a fixed -4 offset
+    # would have wrongly pushed this to the next day)
+    r = us_route.eligible_session_us("2026-01-15T20:30:00Z", None)
+    assert r["eligible_from_date"] == "2026-01-15" and r["same_session_partial"] is True
+    # Friday after-hours rolls over the weekend to Monday
+    r = us_route.eligible_session_us("2026-08-28T21:30:00Z", None)
+    assert r["eligible_from_date"] == "2026-08-31"
+    # Saturday acceptance -> Monday
+    r = us_route.eligible_session_us("2026-08-29T15:00:00Z", None)
+    assert r["eligible_from_date"] == "2026-08-31"
     r = us_route.eligible_session_us(None, "2026-08-27")
     assert r["precision"] == "DATE"
+    assert r["session_calendar"] == "WEEKDAY_APPROX_NO_HOLIDAYS"
 
 
 def test_staged_classification_8k_without_items_stays_pending(conn):
@@ -142,3 +158,56 @@ def test_late_enrichment_reclassifies_previously_neutral_8k(conn):
     row = conn.execute("SELECT relevance, event_id FROM sec_filing"
                        " WHERE accession='0001000002-26-000201'").fetchone()
     assert row["relevance"] == "HARD_NEGATIVE" and row["event_id"] is not None
+
+
+def test_13d_event_links_subject_not_filer(conn):
+    """Filer CIK != subject CIK: the STAKE_ACTIVIST event must attach to the
+    SUBJECT company; the filer being first in the index must not matter."""
+    from investment_tool import us_ingest, us_route
+
+    # subject company exists in universe with cik 2000009
+    conn.execute("INSERT INTO company(company_id, name_en, cik, created_asof)"
+                 " VALUES('US:TGT9','Target Nine','2000009','2026-01-01T00:00:00Z')")
+    conn.execute("INSERT INTO listing(listing_id, company_id, ticker, exchange, currency)"
+                 " VALUES('NYSE:TGT9','US:TGT9','TGT9','NYSE','USD')")
+    conn.commit()
+    # dual index rows: FILER cik arrives FIRST, subject second (same accession)
+    idx = b"\n".join([
+        b"CIK|Company Name|Form Type|Date Filed|File Name",
+        b"--------",
+        b"3000001|ACTIVIST LP|SC 13D|20260827|edgar/data/3000001/0003000001-26-000900.txt",
+        b"2000009|TARGET NINE INC|SC 13D|20260827|edgar/data/2000009/0003000001-26-000900.txt",
+    ])
+    us_ingest.ingest_daily_index(conn, idx, "2026-08-27", "m")
+    # role hint from the freshness channel: the activist is the filer
+    conn.execute("UPDATE filing_party SET role='FILER'"
+                 " WHERE accession='0003000001-26-000900' AND cik='3000001'")
+    conn.commit()
+    us_route.route_unclassified(conn)
+    linked = conn.execute(
+        "SELECT ec.company_id FROM event_company ec JOIN event e ON e.event_id=ec.event_id"
+        " WHERE e.type='STAKE_ACTIVIST'").fetchall()
+    assert [r["company_id"] for r in linked] == ["US:TGT9"]
+    subj = conn.execute("SELECT role FROM filing_party"
+                        " WHERE accession='0003000001-26-000900' AND cik='2000009'").fetchone()
+    assert subj["role"] == "SUBJECT"
+    import json
+    ev = conn.execute("SELECT dims_json, excerpt FROM evidence"
+                      " WHERE event_id LIKE 'ev_us_%'").fetchone()
+    assert json.loads(ev["dims_json"])["independence"] == 2
+    assert "NOT for claims about the subject" in ev["excerpt"]
+
+
+def test_13d_unresolved_subject_links_no_company(conn):
+    from investment_tool import us_ingest, us_route
+
+    idx = b"\n".join([
+        b"CIK|Company Name|Form Type|Date Filed|File Name",
+        b"--------",
+        b"3000002|MYSTERY LP|SC 13D|20260827|edgar/data/3000002/0003000002-26-000901.txt",
+    ])
+    us_ingest.ingest_daily_index(conn, idx, "2026-08-27", "m")
+    us_route.route_unclassified(conn)
+    assert conn.execute("SELECT COUNT(*) FROM event_company").fetchone()[0] == 0
+    ev = conn.execute("SELECT excerpt FROM evidence").fetchone()
+    assert "SUBJECT_UNRESOLVED" in ev["excerpt"]

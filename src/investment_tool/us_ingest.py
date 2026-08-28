@@ -56,6 +56,10 @@ def ingest_daily_index(conn: sqlite3.Connection, payload: bytes, index_date: str
     kept = 0
     seen = utc_now()
     try:
+        if conn.in_transaction:
+            # close any caller-side implicit transaction so the batch below is
+            # a single atomic unit of rows + checkpoint
+            conn.commit()
         conn.execute("BEGIN")
         for r in rows:
             if r["form"] not in FORM_ALLOWLIST:
