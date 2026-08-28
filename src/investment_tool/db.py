@@ -237,6 +237,62 @@ CREATE TABLE IF NOT EXISTS market_snapshot(
   manifest_id TEXT,
   PRIMARY KEY(listing_id, asof_date)
 );
+CREATE TABLE IF NOT EXISTS sec_filing(
+  accession TEXT PRIMARY KEY,
+  cik TEXT NOT NULL,
+  form TEXT NOT NULL,
+  is_amendment INTEGER NOT NULL DEFAULT 0,
+  amends_accession TEXT,
+  amend_link_state TEXT,
+  filing_date TEXT NOT NULL,
+  report_period TEXT,
+  accepted_at_utc TEXT,
+  items_csv TEXT,
+  primary_doc_name TEXT,
+  primary_doc_url TEXT,
+  source_updated_at_utc TEXT,
+  first_seen_at_utc TEXT NOT NULL,
+  classification_version TEXT,
+  relevance TEXT,
+  event_id TEXT,
+  supersession_state TEXT NOT NULL DEFAULT 'ACTIVE',
+  quality TEXT NOT NULL,
+  manifest_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_secfiling_cik ON sec_filing(cik, form, filing_date);
+CREATE INDEX IF NOT EXISTS idx_secfiling_seen ON sec_filing(first_seen_at_utc);
+CREATE TABLE IF NOT EXISTS sec_filing_document(
+  accession TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  doc_type TEXT,
+  url TEXT NOT NULL,
+  sha256 TEXT,
+  manifest_id TEXT,
+  PRIMARY KEY(accession, filename)
+);
+CREATE TABLE IF NOT EXISTS filing_party(
+  accession TEXT NOT NULL,
+  cik TEXT NOT NULL,
+  role TEXT NOT NULL,
+  listing_match_json TEXT,
+  PRIMARY KEY(accession, cik, role)
+);
+CREATE TABLE IF NOT EXISTS cik_map(
+  cik TEXT NOT NULL,
+  ticker TEXT NOT NULL,
+  exchange TEXT,
+  name TEXT,
+  state TEXT NOT NULL,
+  source TEXT NOT NULL,
+  valid_from_date TEXT NOT NULL,
+  valid_to_date TEXT,
+  PRIMARY KEY(cik, ticker, valid_from_date)
+);
+CREATE TABLE IF NOT EXISTS source_checkpoint(
+  source_id TEXT PRIMARY KEY,
+  cursor TEXT,
+  updated_at_utc TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_secday_date ON security_day(trade_date);
 CREATE INDEX IF NOT EXISTS idx_ann_code ON announcement(sec_code, published_at_utc);
 CREATE INDEX IF NOT EXISTS idx_listing_company ON listing(company_id);
@@ -284,6 +340,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
         " VALUES('s1_additive_columns', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
+        " VALUES('s2a_us_tables', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
     )
     lifecycle_done = conn.execute(
         "SELECT 1 FROM schema_migration WHERE migration_id='s1_artifact_lifecycle'"
