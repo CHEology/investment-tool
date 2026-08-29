@@ -17,9 +17,11 @@
   data remain explicit quality states. No paid or trial-only dependency without
   explicit approval.
 - INV-8 Deterministic/cheap methods for broad screening; frontier models only
-  for shortlisted candidates; >=2 independent analyses (different providers
-  preferred) plus adjudication; agreement is not proof; material claims need
-  exact source grounding and deterministic recomputation.
+  for shortlisted candidates; >=2 blind analyses from distinct Agent contexts
+  plus adjudication. The two Agents may use the same provider and model;
+  provider/model diversity is disclosed but is not an independence gate.
+  Agreement is not proof; material claims need exact source grounding and
+  deterministic recomputation.
 - INV-9 Single-user V1. Chinese primary output. No trading, no broker write
   access, no automatic position sizing, no "definitely unpriced" claims.
   Conditional valuation/observation zones allowed.

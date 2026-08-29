@@ -286,9 +286,21 @@ CREATE TABLE IF NOT EXISTS claim(
                               -- JUDGMENT_UNANCHORED
   verification_note TEXT,
   verification_detail TEXT,   -- JSON: quote/temporal/source-class/semantic axes
-  superseded_by TEXT
+  superseded_by TEXT,
+  origin_run_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_claim_case ON claim(case_id, role);
+CREATE TABLE IF NOT EXISTS analysis_pair(
+  pair_id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL REFERENCES research_case(case_id),
+  bundle_version INTEGER NOT NULL,
+  bundle_sha256 TEXT NOT NULL,
+  loop_index INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'OPEN', -- OPEN|COMPLETE|SUPERSEDED
+  created_at_utc TEXT NOT NULL,
+  first_output_at_utc TEXT,
+  UNIQUE(case_id, bundle_version, loop_index)
+);
 CREATE TABLE IF NOT EXISTS agent_run(
   run_id TEXT PRIMARY KEY,
   case_id TEXT NOT NULL,
@@ -305,7 +317,17 @@ CREATE TABLE IF NOT EXISTS agent_run(
   status TEXT NOT NULL,       -- IMPORTED | REJECTED_IMPORT | FAILED
   started_at_utc TEXT,
   ended_at_utc TEXT,
-  note TEXT
+  note TEXT,
+  order_id TEXT,
+  pair_id TEXT,
+  bundle_version INTEGER,
+  agent_instance_id TEXT,
+  context_id TEXT,
+  context_provenance TEXT,
+  role_input_sha256 TEXT,
+  input_manifest_verified INTEGER NOT NULL DEFAULT 0,
+  visible_roles_json TEXT,
+  output_path TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agentrun_case ON agent_run(case_id, role);
 CREATE TABLE IF NOT EXISTS xbrl_fact(
@@ -449,6 +471,19 @@ ADDITIVE_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "claim": (
         ("verification_detail", "TEXT"),
+        ("origin_run_id", "TEXT"),
+    ),
+    "agent_run": (
+        ("order_id", "TEXT"),
+        ("pair_id", "TEXT"),
+        ("bundle_version", "INTEGER"),
+        ("agent_instance_id", "TEXT"),
+        ("context_id", "TEXT"),
+        ("context_provenance", "TEXT"),
+        ("role_input_sha256", "TEXT"),
+        ("input_manifest_verified", "INTEGER NOT NULL DEFAULT 0"),
+        ("visible_roles_json", "TEXT"),
+        ("output_path", "TEXT"),
     ),
 }
 
@@ -501,6 +536,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
         " VALUES('h2_xbrl_fact', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
+        " VALUES('h5_agent_contexts', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
     )
     junction_done = conn.execute(
         "SELECT 1 FROM schema_migration WHERE migration_id='h11_case_evidence'"

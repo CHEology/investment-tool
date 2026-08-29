@@ -121,10 +121,21 @@ access. CI runs tests only, never production. Scheduler: launchd (S5).
 
 ## Modes & cost
 
-C0 no paid LLM (current) -> C1 one provider (bring-up) -> C2 two providers
-(standard) -> C3 three+. Caps: $100/month, $15/dossier (config, enforced
-pre-call). Paid calls require explicit user approval (D1). Dossiers disclose
-role/context/model/provider counts and any reduced independence.
+C0 manual workqueue -> C1 one Agent runtime -> C2 two or more runtimes/models
+(optional diversity). Independence is established by two frozen blind work
+orders and two distinct fresh Agent contexts; it does not require different
+providers or models. Caps: $100/month, $15/dossier (config, enforced pre-call
+for metered APIs). Dossiers separately disclose Agent-context independence and
+model/provider diversity.
+
+The `codex` runtime is application-invoked through a fresh ephemeral Codex CLI
+session for every role. Its Search Agent may use Web Search without a source
+whitelist and follow newly discovered entities autonomously. Search snippets
+are leads only: every cited page must pass through `invest research fetch`, be
+stored with lineage/timestamps, and then survive claim validation. The two
+analyst orders are both frozen before either output exists; constructive and
+adversarial read the same bundle, their role inputs exclude the other answer,
+and their contracts prohibit cross-reading.
 
 ## Slices
 

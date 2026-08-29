@@ -156,11 +156,16 @@ def _adj(decision="UNRESOLVED", reasons=None, **kw):
 
 
 def _import(conn, cfg, case_id, role, doc, tmp_path):
+    if role in ("constructive", "adversarial"):
+        doc = dict(doc)
+        doc.setdefault("independent_verdict", "INSUFFICIENT")
+        doc.setdefault("verdict_confidence", "LOW")
+        doc.setdefault("verdict_reason_claim_ids", [])
     p = tmp_path / f"{role}_out.json"
     p.write_text(json.dumps(doc, ensure_ascii=False))
     return research.import_role_output(
         conn, cfg, case_id, role, str(p), model_id="test-model",
-        provider="test", runtime="pytest")
+        provider="test", runtime="pytest", allow_legacy=True)
 
 
 def _search_doc(evidence_id, quote, extra_claims=(), state="COMPLETE"):
@@ -199,6 +204,18 @@ def test_uncaptured_source_rejected_with_capture_hint(conn, cfg, tmp_path):
                   tmp_path)
     assert out["status"] == "REJECTED_IMPORT"
     assert any("evidence-fetch" in p for p in out["problems"])
+
+
+def test_search_evidence_used_must_be_captured_for_case(conn, cfg, tmp_path):
+    case = _open(conn, cfg)
+    doc = {"role": "search", "search_state": "COMPLETE", "queries": ["q"],
+           "coverage": {"news": "FOUND"},
+           "evidence_used": ["evd_not_captured"],
+           "negative_findings": [], "competing_explanations": [],
+           "new_questions": []}
+    out = _import(conn, cfg, case["case_id"], "search", doc, tmp_path)
+    assert out["status"] == "REJECTED_IMPORT"
+    assert any("uncaptured ID" in p for p in out["problems"])
 
 
 def test_temporal_cutoff_enforced_mechanically(conn, cfg, tmp_path):
