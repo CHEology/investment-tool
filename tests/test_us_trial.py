@@ -13,7 +13,7 @@ from investment_tool import reaction as reaction_mod
 @pytest.fixture
 def tcfg():
     # v0.2 = event-anchored gates + dual anchors + episodes (PR-B)
-    return config_mod.load("us_trial_v0.3")
+    return config_mod.load("us_trial_v0.4")
 
 
 def _sessions(n: int, end: str = "2026-08-28") -> list[str]:

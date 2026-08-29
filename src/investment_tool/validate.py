@@ -39,16 +39,28 @@ def _freeze_local_date(ts_utc: str, exchange: str | None) -> str:
 
 
 def _ledger_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """ALL candidates with frozen artifacts. Invalidated ones stay VISIBLE in
-    the historical ledger with an explicit excluded state — they are never
-    tracked as control observations and never silently absent."""
+    """One row per candidate, anchored to the correct PUBLICATION artifact
+    (H0.1/F-E): the investment-performance clock starts at the latest valid
+    DOSSIER when a research case completed, else the latest valid CARD.
+    BUNDLE/QUANT_PACK creation never resets the clock — each kind versions
+    independently, so MAX(version) across kinds was wrong (it could match
+    several artifacts and anchor to a working artifact's timestamp).
+    Invalidated ones stay VISIBLE with an explicit excluded state — never
+    tracked as control observations, never silently absent."""
     return conn.execute(
         """
-        SELECT c.candidate_id, c.company_id, c.state, fa.frozen_at_utc, fa.status
+        SELECT c.candidate_id, c.company_id, c.state,
+               fa.frozen_at_utc, fa.status, fa.kind
         FROM candidate c
-        JOIN frozen_artifact fa ON fa.candidate_id = c.candidate_id
-          AND fa.version = (SELECT MAX(version) FROM frozen_artifact
-                            WHERE candidate_id = c.candidate_id)
+        JOIN frozen_artifact fa ON fa.artifact_id = (
+            SELECT f2.artifact_id FROM frozen_artifact f2
+            WHERE f2.candidate_id = c.candidate_id
+              AND f2.kind IN ('DOSSIER', 'CARD')
+            ORDER BY CASE f2.kind WHEN 'DOSSIER' THEN 0 ELSE 1 END,
+                     CASE f2.status WHEN 'VALID' THEN 0
+                                    WHEN 'SUPERSEDED' THEN 1 ELSE 2 END,
+                     f2.version DESC
+            LIMIT 1)
         """
     ).fetchall()
 
