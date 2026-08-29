@@ -410,6 +410,20 @@ def _num_close(a: float, b: float) -> bool:
     return abs(a - b) <= max(0.01 * abs(b), 0.002)
 
 
+def _eval_abs_ratio(deriv: dict, quantpack: dict | None):
+    """Shared derivation evaluator (claims + adjudicator reasons)."""
+    num = deriv.get("numerator_value")
+    if deriv.get("numerator_quant_ref") and quantpack is not None:
+        num = _resolve_quant_ref(quantpack, deriv["numerator_quant_ref"])
+    den = deriv.get("denominator_value")
+    if deriv.get("denominator_quant_ref") and quantpack is not None:
+        den = _resolve_quant_ref(quantpack, deriv["denominator_quant_ref"])
+    try:
+        return abs(float(num)) / abs(float(den))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 def _has_comparison_marker(text: str) -> bool:
     t = (text or "").lower()
     # comparison-asserting markers only — generic expectation language
@@ -543,6 +557,19 @@ def validate_claims(conn, case, claims: list[dict],
                     if material:
                         problems.append(f"{cid}: value {val} != quantpack {ref}"
                                         f" at {c['quant_ref']}")
+            elif c.get("derivation", {}).get("op") == "abs_ratio":
+                computed = _eval_abs_ratio(c["derivation"], quantpack)
+                if computed is None:
+                    problems.append(f"{cid}: derivation inputs unresolved")
+                    continue
+                if _num_close(float(val), computed):
+                    c["verification"] = "RECOMPUTED_OK"
+                    c["verification_note"] = f"abs_ratio={computed:.4g}"
+                else:
+                    c["verification"] = "RECOMPUTE_MISMATCH"
+                    if material:
+                        problems.append(f"{cid}: asserted {val} conflicts with"
+                                        f" derived {computed:.4g} (abs_ratio)")
             elif c.get("recompute", {}).get("kind") == "damage_template":
                 from investment_tool import damage
                 spec = c["recompute"]
@@ -804,7 +831,7 @@ def _hist(claims: list[dict]) -> dict:
 def freeze_dossier(conn: sqlite3.Connection, case_id: str) -> dict:
     case = conn.execute("SELECT * FROM research_case WHERE case_id=?",
                         (case_id,)).fetchone()
-    if case["state"] not in ("REJECTED", "UNRESOLVED", "RESEARCH_CANDIDATE"):
+    if case["state"] not in FINAL_STATES:
         return {"error": f"case state {case['state']} is not final"}
     adj = _latest_output(case_id, "adjudicator") or {}
     thesis = _latest_output(case_id, "constructive") or {}
@@ -1039,17 +1066,8 @@ def _validate_decision_reasons(conn, case, doc: dict,
                     problems.append(f"reason {rid}: value {val} does not match"
                                     f" quantpack {r.get('quant_ref')} ({ref})")
             elif deriv and deriv.get("op") == "abs_ratio":
-                num = deriv.get("numerator_value")
-                if deriv.get("numerator_quant_ref") and quantpack is not None:
-                    num = _resolve_quant_ref(quantpack,
-                                             deriv["numerator_quant_ref"])
-                den = deriv.get("denominator_value")
-                if deriv.get("denominator_quant_ref") and quantpack is not None:
-                    den = _resolve_quant_ref(quantpack,
-                                             deriv["denominator_quant_ref"])
-                try:
-                    computed = abs(float(num)) / abs(float(den))
-                except (TypeError, ZeroDivisionError):
+                computed = _eval_abs_ratio(deriv, quantpack)
+                if computed is None:
                     problems.append(f"reason {rid}: derivation inputs unresolved")
                     continue
                 if val is None or not _num_close(float(val), computed):
