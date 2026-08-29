@@ -78,7 +78,8 @@ def compute_event_reaction(conn: sqlite3.Connection, listing_id: str,
     out["event_window_contaminated"] = bool(anchors.get("same_session_partial"))
 
     # ---- causal anchor: pre-event run-up (feature, not a trigger) ----
-    for k, name in ((5, "run_up_5"), (21, "run_up_21")):
+    for k, name in ((5, "run_up_5"), (21, "run_up_21"), (63, "run_up_63"),
+                    (126, "run_up_126"), (252, "run_up_252")):
         if i0 - 1 - k >= 0:
             raw = _ret(series[i0 - 1 - k][1], series[i0 - 1][1])
             out[name] = raw

@@ -14,6 +14,7 @@ def isolate_data_dirs(tmp_path, monkeypatch):
         evidence_gateway,
         lane_a,
         lineage,
+        peers,
         research,
         us_cli,
         us_queue,
@@ -22,7 +23,7 @@ def isolate_data_dirs(tmp_path, monkeypatch):
     )
 
     for mod in (lineage, validate, us_cli, lane_a, us_queue, us_soak,
-                research, evidence_gateway):
+                research, evidence_gateway, peers):
         monkeypatch.setattr(mod, "DEFAULT_DATA_DIR", tmp_path, raising=True)
     monkeypatch.setattr(cards, "CARDS_DIR", tmp_path / "cards", raising=True)
     monkeypatch.setattr(lane_a, "PARAMS_DIR", tmp_path / "params", raising=True)

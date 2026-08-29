@@ -146,6 +146,32 @@ def _mcap_timeline(conn, listing, fundamentals, rx, asof, case):
     return tl, entry
 
 
+def _peer_section(conn, case_id: str, rx: dict, asof: str) -> dict:
+    from investment_tool import peers
+    try:
+        return peers.peer_analysis(conn, case_id, rx, asof)
+    except Exception as exc:   # never blocks the pack; explicit state
+        return {"quality": "ERROR", "error": repr(exc)}
+
+
+def _expectation_state(rx: dict) -> dict:
+    """Multi-horizon pre-event context (H3/F-L): one 21-session run-up never
+    adequately represents prior expectations — expose the whole path with
+    per-field presence, and leave interpretation to the research roles."""
+    fields = {f"mkt_adj_run_up_{k}": rx.get(f"mkt_adj_run_up_{k}")
+              for k in (5, 21, 63, 126, 252)}
+    fields["event_session_mkt_adj"] = rx.get("mkt_adj_post_ret1")
+    fields["post_event_continuation_next1"] = rx.get("mkt_adj_next_ret1")
+    fields["post_event_continuation_car3"] = rx.get("mkt_adj_post_car3")
+    fields["realized_before_entry"] = rx.get("mkt_adj_realized_before_entry")
+    missing = [k for k, v in fields.items() if v is None]
+    return {**fields,
+            "quality": "OK" if not missing else "PARTIAL",
+            "missing": missing,
+            "note": "price-path expectation proxies; guidance trajectory in"
+                    " guidance_extracted; consensus remains external evidence"}
+
+
 def build_quantpack(conn: sqlite3.Connection, cfg, case_id: str, *,
                     live: bool = False, http_factory=None) -> dict:
     from investment_tool import research
@@ -231,6 +257,8 @@ def build_quantpack(conn: sqlite3.Connection, cfg, case_id: str, *,
         "investability": investability,
         "event_mcap_change": event_mcap_change,
         "entry_analysis": entry_analysis,
+        "peer_analysis": _peer_section(conn, case_id, rx, asof),
+        "expectation_state": _expectation_state(rx),
         "guidance_extracted": guidance,
         "damage": {"status": "AGENT_PARAMS_REQUIRED",
                    "templates": ["earnings_decomposition", "market_access",
