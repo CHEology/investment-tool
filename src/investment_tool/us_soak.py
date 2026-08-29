@@ -155,7 +155,10 @@ def soak_report(conn: sqlite3.Connection, window_days: int = 7) -> dict:
     crash-recovery drill. Reports evidence, never asserts beyond it."""
     ledgers = sorted(_soak_dir().glob("us_soak_*.json"))
     entries = [json.loads(p.read_text()) for p in ledgers]
-    synced_dates = sorted({s["date"] for e in entries for s in e.get("synced", [])}
+    # only days whose evening index actually reconciled count as synced —
+    # an attempted-but-PENDING day must not inflate the coverage claim
+    synced_dates = sorted({s["date"] for e in entries for s in e.get("synced", [])
+                           if "INDEX_RECONCILED" in str(s.get("us_completeness"))}
                           | synced_index_dates(conn))
     amendments_natural = conn.execute(
         "SELECT COUNT(*) FROM sec_filing WHERE is_amendment=1"
