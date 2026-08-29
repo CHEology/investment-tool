@@ -603,6 +603,15 @@ def cmd_research(args) -> int:
             rationale=args.rationale, set_by=args.set_by, live=args.live)
     elif args.rcmd == "verify-bundle":
         out = research.verify_bundle(conn, args.case)
+    elif args.rcmd == "run":
+        from investment_tool import agent_runner
+        adapter_cls = agent_runner.ADAPTERS[args.adapter]
+        adapter = (adapter_cls(model_id=args.model) if args.adapter == "anthropic"
+                   else adapter_cls())
+        out = agent_runner.orchestrate(conn, cfg, args.case, adapter)
+    elif args.rcmd == "orders":
+        from investment_tool import agent_runner
+        out = {"orders": agent_runner.orders_status(args.case)}
     else:  # pragma: no cover
         out = {"error": f"unknown research subcommand {args.rcmd}"}
     print(json_mod.dumps(out, ensure_ascii=False, indent=2, default=str))
@@ -782,6 +791,15 @@ def build_parser() -> argparse.ArgumentParser:
     r_pe.add_argument("--rationale", required=True)
     r_pe.add_argument("--set-by", dest="set_by", default="operator")
     r_pe.add_argument("--live", action="store_true", help="fetch peer prices")
+    r_run = rsub.add_parser("run", help="orchestrate a case: deterministic"
+                                        " steps inline, role steps via the"
+                                        " configured Agent adapter (resumable)")
+    r_run.add_argument("--case", required=True)
+    r_run.add_argument("--adapter", choices=["manual", "anthropic"],
+                       default="manual")
+    r_run.add_argument("--model", default="claude-sonnet-5")
+    r_or = rsub.add_parser("orders", help="list work-queue orders")
+    r_or.add_argument("--case", default=None)
     r_vb = rsub.add_parser("verify-bundle", help="recompute a frozen bundle's"
                                                  " hashes; detect mutation")
     r_vb.add_argument("--case", required=True)
