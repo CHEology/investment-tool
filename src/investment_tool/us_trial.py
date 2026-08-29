@@ -1,11 +1,15 @@
 """US Lane A opportunity TRIAL: SEC events -> targeted prices -> multi-horizon
 market-adjusted reactions -> selective filing content -> deterministic
-materiality categories -> candidates / near-misses / explicit rejections.
+routing categories -> LEADS / near-misses / research queue / explicit
+rejections.
 
-Experimental throughout (config us_trial_v0); zero candidates is a valid
-result; A-share thresholds and frozen conclusions untouched. Lookahead: event
-selection and filing content are gated on first_seen_at_utc <= the asof
-cutoff; prices end at the asof session.
+Output naming is deliberate: this layer produces experimental LEADS (price
+trigger + keyword routing), never validated opportunities — it has no
+expectation state and no damage quantification. Experimental throughout
+(config us_trial_v0); zero leads is a valid result; A-share thresholds and
+frozen conclusions untouched. Lookahead: event selection and filing content
+are gated on first_seen_at_utc <= the asof cutoff; prices end at the asof
+session.
 """
 
 from __future__ import annotations
@@ -161,23 +165,31 @@ REJECT_RATIONALE = {
         "非可靠性/重述风险：信息不对称极端，按政策不入围（对应A股立案类政策）",
     "bankruptcy_distress": "破产/持续经营风险：跌幅可能与永久性损伤成比例，不构成过度反应假设",
 }
-ELIGIBLE_RATIONALE = {
-    "management_change": "管理层变动通常为有界成本；若无同时披露的基本面恶化，市场折价可能过度",
-    "earnings_guidance": "业绩/指引类下调需区分一次性因素与结构性恶化；反应可能超出经常性影响",
-    "acquisition_disposition": "并购/剥离公告的重定价常包含情绪成分，需对照交易条款",
-    "financing_dilution": "融资摊薄为可计算的有界稀释；若跌幅显著超过摊薄比例则可能过度",
-    "auditor_change": "审计师更换需区分正常轮换与风险信号",
-    "regulatory_halt": "监管性停牌事件本身已核实，但根本原因未定，需人工确认",
+# Routing rationale only: states WHY the category enters the research queue.
+# It must never assert direction, boundedness, or over/under-reaction — those
+# are research conclusions this layer has no evidence for (review F3).
+ROUTING_RATIONALE = {
+    "management_change": "管理层变动类：变动的性质（离任/任命/原因）与经济影响需研究层判断",
+    "earnings_guidance": "业绩/指引类：意外方向与幅度需对照事前预期与指引差分，本层未接入",
+    "acquisition_disposition": "并购/剥离类：交易条款与对价需研究层核对，本层未读取条款",
+    "financing_dilution": "融资/摊薄类：摊薄比例可计算但本层未计算，需研究层定量",
+    "auditor_change": "审计师更换类：正常轮换与风险信号的区分需研究层判断",
+    "regulatory_halt": "监管性停牌：停牌事实已核实，根本原因未定，需人工确认",
 }
+
+# how content review ended for a TRIGGERED event
+CONTENT_REVIEWED = "REVIEWED"
+CONTENT_BUDGET_DEFERRED = "BUDGET_DEFERRED"
+CONTENT_FETCH_FAILED = "FETCH_FAILED"
 
 
 def assess_and_state(ev: dict, rx: dict, gate: str, hits: list[str], content: dict | None,
-                     tcfg) -> tuple[str, dict]:
+                     tcfg, content_state: str | None = None) -> tuple[str, dict]:
     profile = {"event_id": ev["event_id"], "event_type": ev["type"], "ticker": ev["ticker"],
                "accession": ev["accession"], "accepted_at_utc": ev["accepted_at_utc"],
                "first_seen_at_utc": ev["first_seen_at_utc"], "reaction": rx,
                "gate": gate, "trigger_legs": hits, "content": content,
-               "config_version": tcfg.id}
+               "content_state": content_state, "config_version": tcfg.id}
     if gate == "INSUFFICIENT_DATA":
         return "US_TRIAL_INSUFFICIENT_DATA", profile
     if gate == "NO_TRIGGER":
@@ -185,6 +197,13 @@ def assess_and_state(ev: dict, rx: dict, gate: str, hits: list[str], content: di
     if gate == "NEAR_MISS":
         return "US_TRIAL_NEAR_MISS", profile
     if content is None:
+        # A triggered event without content is NOT a data problem unless the
+        # data is actually missing; budget exhaustion and fetch failures get
+        # their own honest states (review F2).
+        if content_state == CONTENT_BUDGET_DEFERRED:
+            return "US_TRIAL_RESEARCH_PENDING", profile
+        if content_state == CONTENT_FETCH_FAILED:
+            return "US_TRIAL_FETCH_FAILED", profile
         return "US_TRIAL_INSUFFICIENT_DATA", profile
     cat = content["primary"]
     if cat in tcfg.value("content.reject_categories"):
@@ -193,13 +212,13 @@ def assess_and_state(ev: dict, rx: dict, gate: str, hits: list[str], content: di
     if cat in tcfg.value("content.review_only_categories"):
         return "US_TRIAL_NEAR_MISS", profile
     if cat in tcfg.value("content.candidate_eligible_categories"):
-        profile["excess_rationale"] = ELIGIBLE_RATIONALE.get(cat, cat)
+        profile["routing_rationale"] = ROUTING_RATIONALE.get(cat, cat)
         profile["unresolved_questions"] = [
             "事件的现金流影响是否有界（尚无XBRL基本面数据）",
             "是否存在未披露的关联负面信息",
             "同行业/同因子当期表现的对照是否充分（当前仅SPY/QQQ调整）",
         ]
-        return "US_TRIAL_CANDIDATE", profile
+        return "US_TRIAL_LEAD", profile
     return "US_TRIAL_REJECTED_CONTENT_UNCLASSIFIED", profile
 
 
@@ -230,7 +249,7 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
     from investment_tool.providers import sec as sec_mod
 
     summary: dict = {"asof": asof, "generated_at": utc_now(), "config": trial_cfg.id,
-                     "counts": {}, "candidates": [], "near_misses": [],
+                     "counts": {}, "leads": [], "near_misses": [],
                      "rejections": {}, "degraded": []}
     events = select_events(conn, asof)
     summary["counts"]["events_considered"] = len(events)
@@ -245,15 +264,19 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
     http = None
     docs_reviewed = 0
     states: dict[str, int] = {}
+    gates: dict[str, int] = {}
     for ev in events:
         t0, _prec = _t0_date(ev, asof)
         rx = compute_reaction(conn, ev["listing_id"], t0, asof)
         gate, hits = evaluate_gates(rx, trial_cfg)
+        gates[gate] = gates.get(gate, 0) + 1
         content = None
+        content_state = None
         if gate == "TRIGGERED":
             if ev["accession"] is None:
                 content = {"primary": "regulatory_halt", "flags": [],
                            "content_version": us_filing_docs.CONTENT_VERSION}
+                content_state = CONTENT_REVIEWED
             elif docs_reviewed < content_cap:
                 if http is None:
                     http = sec_mod.client()
@@ -274,18 +297,23 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
                     docs_reviewed += 1
                     text = open(fetched["text_path"], encoding="utf-8").read()
                     content = us_filing_docs.assess_content(text, ev["items_csv"])
+                    content_state = CONTENT_REVIEWED
                 else:
                     summary["degraded"].append({"accession": ev["accession"],
                                                 "doc": fetched.get("state")})
-        state, profile = assess_and_state(ev, rx, gate, hits, content, trial_cfg)
+                    content_state = CONTENT_FETCH_FAILED
+            else:
+                content_state = CONTENT_BUDGET_DEFERRED
+        state, profile = assess_and_state(ev, rx, gate, hits, content, trial_cfg,
+                                          content_state=content_state)
         states[state] = states.get(state, 0) + 1
         cid = _upsert_candidate(conn, ev["company_id"], state, profile, trial_cfg.id)
-        if state == "US_TRIAL_CANDIDATE":
-            summary["candidates"].append({"candidate_id": cid, "ticker": ev["ticker"],
-                                          "event_type": ev["type"],
-                                          "category": (content or {}).get("primary"),
-                                          "mkt_adj_post_cum": rx.get("mkt_adj_post_cum"),
-                                          "legs": hits})
+        if state == "US_TRIAL_LEAD":
+            summary["leads"].append({"candidate_id": cid, "ticker": ev["ticker"],
+                                     "event_type": ev["type"],
+                                     "category": (content or {}).get("primary"),
+                                     "mkt_adj_post_cum": rx.get("mkt_adj_post_cum"),
+                                     "legs": hits})
         elif state == "US_TRIAL_NEAR_MISS":
             summary["near_misses"].append({"ticker": ev["ticker"], "legs": hits,
                                            "category": (content or {}).get("primary")})
@@ -294,6 +322,28 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
     conn.commit()
     summary["counts"]["filing_documents_reviewed"] = docs_reviewed
     summary["counts"]["states"] = states
+    # Coverage accounting: every considered event must land in exactly one
+    # state; budget exhaustion and fetch failures are visible, never folded
+    # into "insufficient data" (review F2/F5).
+    rejected_total = sum(n for s, n in states.items() if s.startswith("US_TRIAL_REJECTED_"))
+    coverage = {
+        "events_considered": len(events),
+        "price_eligible": len(events) - gates.get("INSUFFICIENT_DATA", 0),
+        "triggered": gates.get("TRIGGERED", 0),
+        "documents_reviewed": docs_reviewed,
+        "research_pending_budget_deferred": states.get("US_TRIAL_RESEARCH_PENDING", 0),
+        "fetch_failed": states.get("US_TRIAL_FETCH_FAILED", 0),
+        "genuine_missing_data": states.get("US_TRIAL_INSUFFICIENT_DATA", 0),
+        "near_misses": states.get("US_TRIAL_NEAR_MISS", 0),
+        "rejected": rejected_total,
+        "leads": states.get("US_TRIAL_LEAD", 0),
+    }
+    coverage["accounted"] = (coverage["leads"] + coverage["near_misses"]
+                             + coverage["rejected"] + coverage["genuine_missing_data"]
+                             + coverage["research_pending_budget_deferred"]
+                             + coverage["fetch_failed"])
+    coverage["reconciled"] = coverage["accounted"] == coverage["events_considered"]
+    summary["coverage"] = coverage
     out_dir = DEFAULT_DATA_DIR / "audit"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"us_trial_{asof}.json").write_text(

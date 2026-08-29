@@ -464,7 +464,7 @@ def cmd_trial(args) -> int:
                          changelog="US trial thresholds (EXPERIMENTAL; A-share untouched)")
     summary = us_trial.run_trial(conn, cfg, trial_cfg, args.asof)
     frozen = []
-    for c in summary["candidates"]:
+    for c in summary["leads"]:
         row = conn.execute("SELECT * FROM candidate WHERE candidate_id=?",
                            (c["candidate_id"],)).fetchone()
         content = cards_mod.render_us_card_zh(conn, row)

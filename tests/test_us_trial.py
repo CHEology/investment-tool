@@ -99,7 +99,11 @@ def test_admission_requires_eligible_category(conn, tcfg):
     st, prof = us_trial.assess_and_state(
         ev, rx, "TRIGGERED", ["post1"],
         {"primary": "management_change", "flags": [], "content_version": "v"}, tcfg)
-    assert st == "US_TRIAL_CANDIDATE" and prof["unresolved_questions"]
+    assert st == "US_TRIAL_LEAD" and prof["unresolved_questions"]
+    # routing rationale must never assert direction or boundedness
+    assert "routing_rationale" in prof
+    for banned in ("有界", "过度", "下调"):
+        assert banned not in prof["routing_rationale"]
     st, prof = us_trial.assess_and_state(
         ev, rx, "TRIGGERED", ["post1"],
         {"primary": "non_reliance_restatement", "flags": [], "content_version": "v"}, tcfg)
@@ -109,6 +113,32 @@ def test_admission_requires_eligible_category(conn, tcfg):
                                       {"primary": "delisting_compliance", "flags": [],
                                        "content_version": "v"}, tcfg)
     assert st == "US_TRIAL_NEAR_MISS"
+
+
+def test_budget_deferred_is_research_pending_not_insufficient(conn, tcfg):
+    """A TRIGGERED event pushed out by the deep-read budget is RESEARCH_PENDING;
+    calling it insufficient data was the F2 mislabel."""
+    ev = {"event_id": "e_b", "type": "ISSUER_8K", "ticker": "TT",
+          "accession": "a", "accepted_at_utc": None, "first_seen_at_utc": "x"}
+    rx = {"state": "OK", "sessions": 80}
+    st, prof = us_trial.assess_and_state(
+        ev, rx, "TRIGGERED", ["post1"], None, tcfg,
+        content_state=us_trial.CONTENT_BUDGET_DEFERRED)
+    assert st == "US_TRIAL_RESEARCH_PENDING"
+    assert prof["content_state"] == "BUDGET_DEFERRED"
+
+
+def test_fetch_failure_is_its_own_state(conn, tcfg):
+    ev = {"event_id": "e_f", "type": "ISSUER_8K", "ticker": "TT",
+          "accession": "a", "accepted_at_utc": None, "first_seen_at_utc": "x"}
+    rx = {"state": "OK", "sessions": 80}
+    st, _ = us_trial.assess_and_state(
+        ev, rx, "TRIGGERED", ["post1"], None, tcfg,
+        content_state=us_trial.CONTENT_FETCH_FAILED)
+    assert st == "US_TRIAL_FETCH_FAILED"
+    # no content_state at all (nothing more knowable) stays INSUFFICIENT_DATA
+    st, _ = us_trial.assess_and_state(ev, rx, "TRIGGERED", ["post1"], None, tcfg)
+    assert st == "US_TRIAL_INSUFFICIENT_DATA"
 
 
 def test_hard_negative_alone_does_not_admit(conn, tcfg):
@@ -159,7 +189,7 @@ def test_filing_document_parse_and_content():
     assert "management_change" in content["flags"]
 
 
-def test_zero_candidate_summary_shape(conn, tcfg, tmp_path, monkeypatch):
+def test_zero_lead_summary_shape_and_coverage(conn, tcfg, tmp_path, monkeypatch):
     from investment_tool import us_trial as ut
 
     monkeypatch.setattr(ut, "DEFAULT_DATA_DIR", tmp_path)
@@ -169,5 +199,38 @@ def test_zero_candidate_summary_shape(conn, tcfg, tmp_path, monkeypatch):
                                          "manifest": "m"})
     summary = ut.run_trial(conn, None, tcfg, "2026-08-28")
     assert summary["counts"]["events_considered"] == 0
-    assert summary["candidates"] == [] and summary["near_misses"] == []
+    assert summary["leads"] == [] and summary["near_misses"] == []
+    assert summary["coverage"]["reconciled"] is True
     assert (tmp_path / "audit" / "us_trial_2026-08-28.json").exists()
+
+
+def test_coverage_accounts_for_budget_deferral(conn, tcfg, tmp_path, monkeypatch):
+    """Every considered event lands in exactly one coverage bucket; with a
+    content budget of zero, triggered filing events become RESEARCH_PENDING
+    and the summary reconciles (no silent drops)."""
+    from investment_tool import us_trial as ut
+
+    monkeypatch.setattr(ut, "DEFAULT_DATA_DIR", tmp_path)
+    monkeypatch.setattr(us_prices, "ensure_prices",
+                        lambda *a, **k: {"manifest": "m"})
+    dates = _mk_series(conn, days=80, crash_at=79, crash=-0.10, vol_spike=5000000)
+    conn.execute("INSERT INTO event(event_id, scope, type, first_seen_at_utc, state)"
+                 " VALUES('ev_us_cv1','COMPANY','ISSUER_8K',?, 'VERIFIED')",
+                 (f"{dates[-1]}T20:00:00Z",))
+    conn.execute("INSERT INTO event_company(event_id, company_id)"
+                 " VALUES('ev_us_cv1','US:TT')")
+    conn.execute(
+        "INSERT INTO sec_filing(accession, cik, form, is_amendment, filing_date,"
+        " first_seen_at_utc, quality, manifest_id, event_id, accepted_at_utc)"
+        " VALUES('acc-cv1','7000001','8-K',0,?,?, 'OK','m','ev_us_cv1',?)",
+        (dates[-1], f"{dates[-1]}T20:00:00Z", f"{dates[-1]}T12:00:00Z"))
+    conn.commit()
+    summary = ut.run_trial(conn, None, tcfg, dates[-1], content_cap=0)
+    cov = summary["coverage"]
+    assert cov["events_considered"] == 1
+    assert cov["triggered"] == 1
+    assert cov["research_pending_budget_deferred"] == 1
+    assert cov["genuine_missing_data"] == 0
+    assert cov["reconciled"] is True
+    row = conn.execute("SELECT state FROM candidate").fetchone()
+    assert row["state"] == "US_TRIAL_RESEARCH_PENDING"
