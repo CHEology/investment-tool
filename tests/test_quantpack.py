@@ -138,3 +138,85 @@ def test_build_quantpack_sections_and_freeze(conn, cfg, tmp_path, monkeypatch):
     kinds = [r["kind"] for r in conn.execute(
         "SELECT kind FROM frozen_artifact WHERE kind='QUANT_PACK'")]
     assert len(kinds) == 2
+
+
+def test_h21_hrl_duration_pattern_never_summed(conn):
+    """F-A regression (actual HRL shape): a 9-month YTD row and a quarterly
+    row share period_end and filed_date — alternative duration views, NOT
+    share classes. The shortest current-period duration wins; summing (the
+    old behavior, ~1.102B) is the bug."""
+    payload = json.dumps({
+        "cik": 48465,
+        "facts": {"us-gaap": {"WeightedAverageNumberOfDilutedSharesOutstanding":
+                  {"units": {"shares": [
+                      {"start": "2025-10-27", "end": "2026-07-26",
+                       "val": 550_898_000, "filed": "2026-08-27"},
+                      {"start": "2026-04-27", "end": "2026-07-26",
+                       "val": 551_074_000, "filed": "2026-08-27"},
+                  ]}}}}}).encode()
+    us_fundamentals.store_companyfacts(conn, payload, "m")
+    sh = us_fundamentals.shares_outstanding(conn, "48465", "2026-08-28")
+    assert sh["value"] == 551_074_000
+    assert sh["grain"] == "DURATION" and sh["duration_days"] == 90
+    assert sh["quality"] == "APPROX_WEIGHTED_DILUTED"
+
+
+def test_h21_instant_repeats_deduplicate_but_classes_sum(conn):
+    payload = json.dumps({
+        "cik": 7000002,
+        "facts": {"dei": {"EntityCommonStockSharesOutstanding": {"units": {
+            "shares": [
+                # identical repeats (same value, different contexts) dedupe
+                {"end": "2026-06-30", "val": 60_000_000, "filed": "2026-07-30"},
+                {"end": "2026-06-30", "val": 60_000_000, "filed": "2026-07-30"},
+                # a distinct simultaneous value = a genuine second class
+                {"end": "2026-06-30", "val": 40_000_000, "filed": "2026-07-30"},
+            ]}}}}}).encode()
+    us_fundamentals.store_companyfacts(conn, payload, "m")
+    sh = us_fundamentals.shares_outstanding(conn, "7000002", "2026-08-28")
+    assert sh["value"] == 100_000_000
+    assert sh["quality"] == "APPROX_MULTI_CLASS" and sh["grain"] == "INSTANT"
+
+
+def test_h21_entry_aware_mcap_gap(conn, cfg, tmp_path, monkeypatch):
+    """F-B regression: pre-event mcap uses the ACTUAL pre-event close; the
+    entry analysis reports the gap remaining at the first actionable session
+    with explicit dates (here: entry pending -> provisional asof residual)."""
+    _mk_candidate(conn)
+    _load_facts(conn)
+    from test_us_trial import _mk_series
+    _mk_series(conn, moves={75: -0.10, 78: 0.05})   # partial rebound after
+    case = research.open_case(conn, cfg, "cand_x")
+    # rewire the profile reaction to anchor at session 75
+    import json as j
+    row = conn.execute("SELECT profile_json FROM candidate WHERE"
+                       " candidate_id='cand_x'").fetchone()
+    p = j.loads(row["profile_json"])
+    from investment_tool import reaction as rmod
+    sess = [r["trade_date"] for r in conn.execute(
+        "SELECT trade_date FROM security_day WHERE listing_id='NASDAQ:TT'"
+        " ORDER BY trade_date")]
+    anchors = {"event_session": sess[75], "same_session_partial": False,
+               "first_actionable_session": "2027-01-05",  # not traded yet
+               "precision": "TIME"}
+    p["reaction"] = rmod.compute_event_reaction(conn, "NASDAQ:TT", anchors,
+                                                sess[-1])
+    conn.execute("UPDATE candidate SET profile_json=? WHERE candidate_id='cand_x'",
+                 (j.dumps(p, default=str),))
+    conn.commit()
+    quantpack.build_quantpack(conn, cfg, case["case_id"])
+    pack = j.loads((research.case_dir(case["case_id"])
+                    / "quantpack_latest.json").read_text())
+    tl = pack["event_mcap_change"]
+    ent = pack["entry_analysis"]
+    assert tl["pre_event"]["date"] == sess[74]
+    assert tl["event_close"]["date"] == sess[75]
+    # event-day abnormal change anchored on the true pre-event mcap
+    assert tl["event_session_abnormal_change"] == pytest.approx(
+        tl["pre_event"]["mcap"] * pack["reaction"]["mkt_adj_post_ret1"])
+    assert ent["status"] == "PENDING_SESSION"
+    assert ent["provisional_residual_gap_asof"] == pytest.approx(
+        tl["cumulative_abnormal_change_asof"])
+    # the rebound reduced the residual vs the event-day move
+    assert abs(ent["provisional_residual_gap_asof"]) < abs(
+        tl["event_session_abnormal_change"])

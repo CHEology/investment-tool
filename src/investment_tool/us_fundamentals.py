@@ -90,35 +90,62 @@ def fetch_companyfacts(conn: sqlite3.Connection, cfg, http, cik: str) -> dict:
 
 
 def shares_outstanding(conn: sqlite3.Connection, cik: str, asof: str) -> dict:
-    """Latest cover-page share count filed on/before asof; same-period-end
-    class rows are summed (multi-class approximation, flagged)."""
-    rows = []
-    used_tag = None
+    """Grain-correct share count (H2.1/F-A).
+
+    Fact grains are NOT interchangeable and must never be summed across
+    grains:
+    - INSTANT facts (no period_start) are point-in-time counts — the
+      issuer's cover page or balance sheet. Distinct simultaneous instant
+      values indicate genuine share classes and are summed
+      (APPROX_MULTI_CLASS); identical repeats deduplicate.
+    - DURATION facts (weighted-average shares) are averages over a window.
+      A quarterly row and a year-to-date row share the same period_end and
+      filing — they are ALTERNATIVE views of one share count, so the
+      fallback selects the SHORTEST current-period duration and never sums
+      (the old sum produced ~1.102B for HRL instead of ~551M).
+    """
+    from datetime import date as _date
+
     for tag in SHARES_TAGS:
         rows = conn.execute(
-            "SELECT period_end, value, filed_date FROM xbrl_fact WHERE cik=?"
-            " AND tag=? AND filed_date<=?"
+            "SELECT period_start, period_end, value, filed_date FROM xbrl_fact"
+            " WHERE cik=? AND tag=? AND filed_date<=?"
             " ORDER BY period_end DESC, filed_date DESC",
             (str(int(cik)), tag, asof)).fetchall()
-        if rows:
-            used_tag = tag
-            break
-    if not rows:
-        return {"quality": "MISSING", "value": None}
-    latest_end = rows[0]["period_end"]
-    same = [r for r in rows if r["period_end"] == latest_end]
-    # one row per filing date; take the newest filing's rows only
-    newest_filed = max(r["filed_date"] for r in same)
-    vals = [float(r["value"]) for r in same if r["filed_date"] == newest_filed]
-    total = sum(vals)
-    quality = "OK" if len(vals) == 1 else "APPROX_MULTI_CLASS"
-    if used_tag == "WeightedAverageNumberOfDilutedSharesOutstanding":
-        quality = "APPROX_WEIGHTED_DILUTED"
-    elif used_tag != "EntityCommonStockSharesOutstanding":
-        quality = "APPROX_BALANCE_SHEET_TAG"
-    return {"value": total, "period_end": latest_end,
-            "filed_date": newest_filed, "tag": used_tag,
-            "class_rows": len(vals), "quality": quality}
+        if not rows:
+            continue
+        instants = [r for r in rows if not r["period_start"]]
+        if instants:
+            latest_end = instants[0]["period_end"]
+            same = [r for r in instants if r["period_end"] == latest_end]
+            newest_filed = max(r["filed_date"] for r in same)
+            values = sorted({float(r["value"]) for r in same
+                             if r["filed_date"] == newest_filed})
+            total = sum(values)
+            quality = "OK" if len(values) == 1 else "APPROX_MULTI_CLASS"
+            if tag != "EntityCommonStockSharesOutstanding" and quality == "OK":
+                quality = "APPROX_BALANCE_SHEET_TAG"
+            return {"value": total, "period_end": latest_end,
+                    "filed_date": newest_filed, "tag": tag, "grain": "INSTANT",
+                    "class_rows": len(values), "quality": quality}
+        # duration fallback: shortest current-period window, never a sum
+        latest_end = rows[0]["period_end"]
+        same = [r for r in rows if r["period_end"] == latest_end]
+        newest_filed = max(r["filed_date"] for r in same)
+        cands = [r for r in same if r["filed_date"] == newest_filed]
+
+        def _days(r):
+            try:
+                return (_date.fromisoformat(r["period_end"])
+                        - _date.fromisoformat(r["period_start"])).days
+            except ValueError:
+                return 10 ** 6
+        best = min(cands, key=_days)
+        return {"value": float(best["value"]), "period_end": latest_end,
+                "filed_date": newest_filed, "tag": tag, "grain": "DURATION",
+                "duration_days": _days(best),
+                "quality": "APPROX_WEIGHTED_DILUTED"}
+    return {"quality": "MISSING", "value": None}
 
 
 def ttm_revenue(conn: sqlite3.Connection, cik: str, asof: str) -> dict:

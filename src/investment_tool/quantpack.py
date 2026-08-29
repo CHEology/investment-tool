@@ -63,6 +63,89 @@ def extract_guidance(text: str) -> list[dict]:
     return out
 
 
+def _close_at(conn, listing_id: str, op: str, date: str):
+    row = conn.execute(
+        f"SELECT trade_date, COALESCE(close, adj_close) AS c FROM security_day"
+        f" WHERE listing_id=? AND trade_date {op} ? AND"
+        f" COALESCE(close, adj_close) IS NOT NULL ORDER BY trade_date"
+        f" {'DESC' if op in ('<', '<=') else 'ASC'} LIMIT 1",
+        (listing_id, date)).fetchone()
+    return (row["trade_date"], float(row["c"])) if row else (None, None)
+
+
+def _mcap_timeline(conn, listing, fundamentals, rx, asof, case):
+    """Entry-aware, date-explicit market-cap analysis (H2.1/F-B).
+
+    Every comparison names its dates. The event-day calculation uses the
+    ACTUAL pre-event close (never the asof mcap divided by the event
+    return), and the opportunity is evaluated where the system can act: the
+    first actionable entry session. When that session has not traded yet,
+    entry fields are PENDING_SESSION and the asof residual stands in,
+    explicitly labeled."""
+    shares = ((fundamentals.get("market_cap") or {}).get("shares") or {})
+    n_sh = shares.get("value")
+    t0 = rx.get("t0_session")
+    if not (n_sh and t0 and listing):
+        return None, {"status": "MISSING_INPUTS"}
+    lid = listing["listing_id"]
+    pre_d, pre_c = _close_at(conn, lid, "<", t0)
+    evt_d, evt_c = _close_at(conn, lid, ">=", t0)
+    asof_d, asof_c = _close_at(conn, lid, "<=", asof)
+    act = (rx.get("anchors") or {}).get("first_actionable_session")
+    ent_d, ent_c = _close_at(conn, lid, ">=", act) if act else (None, None)
+    if pre_c is None:
+        return None, {"status": "NO_PRE_EVENT_CLOSE"}
+    pre_mcap = n_sh * pre_c
+    quality = shares.get("quality")
+    tl = {
+        "shares_used": {"value": n_sh, "quality": quality,
+                        "grain": shares.get("grain")},
+        "pre_event": {"date": pre_d, "close": pre_c, "mcap": pre_mcap},
+        "event_close": {"date": evt_d, "close": evt_c,
+                        "mcap": n_sh * evt_c if evt_c else None},
+        "asof": {"date": asof_d, "close": asof_c,
+                 "mcap": n_sh * asof_c if asof_c else None},
+        "event_session_abnormal_change":
+            pre_mcap * rx["mkt_adj_post_ret1"]
+            if rx.get("mkt_adj_post_ret1") is not None else None,
+        "cumulative_abnormal_change_asof":
+            pre_mcap * rx["mkt_adj_post_cum"]
+            if rx.get("mkt_adj_post_cum") is not None else None,
+        "quality": quality,
+        # legacy alias kept for claim continuity (now correctly pre-anchored)
+        "pre_event_mcap_est": pre_mcap,
+        "abnormal_change_est":
+            pre_mcap * rx["mkt_adj_post_ret1"]
+            if rx.get("mkt_adj_post_ret1") is not None else None,
+    }
+    if ent_c is not None:
+        realized = rx.get("mkt_adj_realized_before_entry")
+        entry = {
+            "status": "OK", "entry_session": ent_d, "entry_close": ent_c,
+            "entry_mcap": n_sh * ent_c,
+            "realized_before_entry_change":
+                pre_mcap * realized if realized is not None else None,
+            "remaining_gap_at_entry":
+                pre_mcap * realized if realized is not None else None,
+            "basis": "pre-event mcap x mkt-adj return from pre-event close"
+                     " to entry close (negative = repricing still standing)",
+        }
+    else:
+        entry = {
+            "status": "PENDING_SESSION",
+            "first_actionable_session": act,
+            "remaining_gap_at_entry": None,
+            "provisional_residual_gap_asof":
+                tl["cumulative_abnormal_change_asof"],
+            "provisional_price_date": asof_d,
+            "basis": "entry session has not traded yet; the asof residual"
+                     " stands in, explicitly provisional",
+        }
+    entry["residual_gap_asof"] = tl["cumulative_abnormal_change_asof"]
+    entry["quality"] = quality
+    return tl, entry
+
+
 def build_quantpack(conn: sqlite3.Connection, cfg, case_id: str, *,
                     live: bool = False, http_factory=None) -> dict:
     from investment_tool import research
@@ -118,17 +201,8 @@ def build_quantpack(conn: sqlite3.Connection, cfg, case_id: str, *,
             "quality": "OK" if mc.get("value") and adv.get("value")
             else "PARTIAL"}
 
-    mcap_val = (fundamentals.get("market_cap") or {}).get("value")
-    event_mcap_change = None
-    if mcap_val and rx.get("mkt_adj_post_ret1") is not None:
-        pre = mcap_val / (1 + rx["post_ret1"]) if rx.get("post_ret1") not in (
-            None, -1) else mcap_val
-        event_mcap_change = {
-            "pre_event_mcap_est": pre,
-            "abnormal_change_est": pre * rx["mkt_adj_post_ret1"],
-            "basis": "pre-event mcap x mkt-adj event-session return",
-            "quality": (fundamentals.get("market_cap") or {}).get("quality"),
-        }
+    event_mcap_change, entry_analysis = _mcap_timeline(
+        conn, listing, fundamentals, rx, asof, case)
 
     guidance: dict = {"filings": {}, "evidence": {},
                       "quality": "EXTRACTED_HEURISTIC"}
@@ -156,6 +230,7 @@ def build_quantpack(conn: sqlite3.Connection, cfg, case_id: str, *,
         "valuation": valuation,
         "investability": investability,
         "event_mcap_change": event_mcap_change,
+        "entry_analysis": entry_analysis,
         "guidance_extracted": guidance,
         "damage": {"status": "AGENT_PARAMS_REQUIRED",
                    "templates": ["earnings_decomposition", "market_access",
