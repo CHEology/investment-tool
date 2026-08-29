@@ -242,6 +242,78 @@ CREATE TABLE IF NOT EXISTS research_queue(
 );
 CREATE INDEX IF NOT EXISTS idx_rq_state_rank
   ON research_queue(state, rank_score DESC);
+CREATE TABLE IF NOT EXISTS research_case(
+  case_id TEXT PRIMARY KEY,
+  candidate_id TEXT NOT NULL,
+  company_id TEXT NOT NULL,
+  ticker TEXT,
+  state TEXT NOT NULL,       -- OPENED|EVIDENCE_SEARCH|BUNDLE_FROZEN|QUANT_READY|
+                             -- UNDER_CONSTRUCTIVE|UNDER_ADVERSARIAL|REBUTTAL|
+                             -- ADJUDICATION|REJECTED|UNRESOLVED|
+                             -- RESEARCH_REQUESTED|RESEARCH_CANDIDATE
+  decision_cutoff_utc TEXT NOT NULL,
+  bundle_version INTEGER NOT NULL DEFAULT 0,
+  loop_count INTEGER NOT NULL DEFAULT 0,
+  opened_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL,
+  config_version TEXT
+);
+CREATE TABLE IF NOT EXISTS evidence_bundle(
+  bundle_id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL REFERENCES research_case(case_id),
+  version INTEGER NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  path TEXT NOT NULL,
+  frozen_at_utc TEXT NOT NULL,
+  source_count INTEGER NOT NULL DEFAULT 0,
+  coverage_json TEXT
+);
+CREATE TABLE IF NOT EXISTS claim(
+  claim_id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL,
+  bundle_version INTEGER,
+  role TEXT NOT NULL,
+  claim_type TEXT NOT NULL,   -- FACTUAL | NUMERIC | JUDGMENT
+  material INTEGER NOT NULL DEFAULT 0,
+  text TEXT NOT NULL,
+  source_id TEXT,
+  locator TEXT,
+  quote TEXT,
+  quant_ref TEXT,
+  temporal_basis TEXT,        -- DECISION | HINDSIGHT
+  verification TEXT NOT NULL, -- SUPPORTED|UNSUPPORTED|RECOMPUTED_OK|
+                              -- RECOMPUTE_MISMATCH|CONFLICTED|JUDGMENT_LINKED|
+                              -- JUDGMENT_UNANCHORED
+  verification_note TEXT,
+  verification_detail TEXT,   -- JSON: quote/temporal/source-class/semantic axes
+  superseded_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_claim_case ON claim(case_id, role);
+CREATE TABLE IF NOT EXISTS agent_run(
+  run_id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  model_id TEXT,
+  provider TEXT,
+  runtime TEXT,
+  prompt_version TEXT,
+  input_sha256 TEXT,
+  output_sha256 TEXT,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  cost_usd REAL,
+  status TEXT NOT NULL,       -- IMPORTED | REJECTED_IMPORT | FAILED
+  started_at_utc TEXT,
+  ended_at_utc TEXT,
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agentrun_case ON agent_run(case_id, role);
+CREATE TABLE IF NOT EXISTS case_evidence(
+  case_id TEXT NOT NULL,
+  evidence_id TEXT NOT NULL,
+  added_at_utc TEXT NOT NULL,
+  PRIMARY KEY(case_id, evidence_id)
+);
 CREATE TABLE IF NOT EXISTS schema_migration(
   migration_id TEXT PRIMARY KEY,
   applied_at_utc TEXT NOT NULL
@@ -347,6 +419,18 @@ ADDITIVE_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "cik_map": (
         ("stale_since_date", "TEXT"),
     ),
+    # research foundation (H1): evidence rows gain research-case linkage and
+    # open-world source metadata
+    "evidence": (
+        ("case_id", "TEXT"),
+        ("title", "TEXT"),
+        ("source_class", "TEXT"),
+        ("content_path", "TEXT"),
+        ("access_note", "TEXT"),
+    ),
+    "claim": (
+        ("verification_detail", "TEXT"),
+    ),
 }
 
 
@@ -390,6 +474,25 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO schema_migration(migration_id, applied_at_utc)"
             " VALUES('h0_doc_review_rename', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+        )
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
+        " VALUES('h1_research_foundation', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+    )
+    junction_done = conn.execute(
+        "SELECT 1 FROM schema_migration WHERE migration_id='h11_case_evidence'"
+    ).fetchone()
+    if junction_done is None:
+        # evidence becomes globally content-addressed; existing single-case
+        # linkage backfills into the junction (no rows are lost or moved)
+        conn.execute(
+            "INSERT OR IGNORE INTO case_evidence(case_id, evidence_id, added_at_utc)"
+            " SELECT case_id, evidence_id, first_seen_at_utc FROM evidence"
+            " WHERE case_id IS NOT NULL"
+        )
+        conn.execute(
+            "INSERT INTO schema_migration(migration_id, applied_at_utc)"
+            " VALUES('h11_case_evidence', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
         )
     lifecycle_done = conn.execute(
         "SELECT 1 FROM schema_migration WHERE migration_id='s1_artifact_lifecycle'"

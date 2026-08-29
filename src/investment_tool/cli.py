@@ -535,6 +535,56 @@ def cmd_soak_report(args) -> int:
     return 0 if report["gates"]["all_passed"] else 2
 
 
+def _research_cfg(conn):
+    from investment_tool import config as config_mod2
+
+    cfg = config_mod2.load("us_trial_v0.3")
+    config_mod2.register(conn, cfg,
+                         changelog="US trial v0.3: contamination-aware gates,"
+                                   " bounded event lookback (H0)")
+    return cfg
+
+
+def cmd_research(args) -> int:
+    import json as json_mod
+
+    from investment_tool import evidence_gateway, research
+
+    conn = connect()
+    cfg = _research_cfg(conn)
+    if args.rcmd == "open":
+        out = research.open_case(conn, cfg, args.candidate)
+    elif args.rcmd == "status":
+        rows = [dict(r) for r in conn.execute(
+            "SELECT case_id, ticker, state, bundle_version, loop_count,"
+            " decision_cutoff_utc FROM research_case ORDER BY opened_at_utc")]
+        out = {"cases": rows}
+    elif args.rcmd == "freeze-bundle":
+        out = research.freeze_bundle(conn, args.case)
+    elif args.rcmd == "export":
+        out = research.export_role_view(conn, args.case, args.role)
+    elif args.rcmd == "fetch":
+        out = evidence_gateway.capture(
+            conn, cfg, args.case, args.url, published_at_utc=args.published_at,
+            title=args.title, source_class=args.source_class, note=args.note)
+    elif args.rcmd == "import":
+        out = research.import_role_output(
+            conn, cfg, args.case, args.role, args.file,
+            model_id=args.model_id, provider=args.provider,
+            runtime=args.runtime, tokens_in=args.tokens_in,
+            tokens_out=args.tokens_out, cost_usd=args.cost_usd)
+    elif args.rcmd == "dossier":
+        out = research.freeze_dossier(conn, args.case)
+    elif args.rcmd == "rank":
+        out = research.rank_cases(conn)
+    elif args.rcmd == "verify-bundle":
+        out = research.verify_bundle(conn, args.case)
+    else:  # pragma: no cover
+        out = {"error": f"unknown research subcommand {args.rcmd}"}
+    print(json_mod.dumps(out, ensure_ascii=False, indent=2, default=str))
+    return 0 if "error" not in out and out.get("status") != "REJECTED_IMPORT" else 2
+
+
 def cmd_status(args) -> int:
     conn = connect()
     for table in ("company", "listing", "manifest", "security_day", "announcement",
@@ -654,6 +704,49 @@ def build_parser() -> argparse.ArgumentParser:
                         help="aggregate soak ledgers and evaluate the live-gate"
                              " criteria (PR-G)")
     sr.set_defaults(func=cmd_soak_report)
+
+    rs = sub.add_parser("research", help="research-case lifecycle (H1):"
+                                         " open/export/fetch/import/dossier")
+    rsub = rs.add_subparsers(dest="rcmd", required=True)
+    r_open = rsub.add_parser("open", help="open (or reuse) a case for a candidate")
+    r_open.add_argument("--candidate", required=True)
+    rsub.add_parser("status", help="list research cases")
+    r_fb = rsub.add_parser("freeze-bundle", help="freeze the next EvidenceBundle")
+    r_fb.add_argument("--case", required=True)
+    r_ex = rsub.add_parser("export", help="write a role's working directory")
+    r_ex.add_argument("--case", required=True)
+    r_ex.add_argument("--role", required=True,
+                      choices=["search", "constructive", "adversarial",
+                               "rebuttal", "semantic_review", "adjudicator"])
+    r_f = rsub.add_parser("fetch", help="capture one URL as case evidence"
+                                        " (the ONLY road from web to evidence)")
+    r_f.add_argument("url")
+    r_f.add_argument("--case", required=True)
+    r_f.add_argument("--published-at", dest="published_at", default=None,
+                     help="source publication time ISO-8601Z when known")
+    r_f.add_argument("--title", default=None)
+    r_f.add_argument("--source-class", dest="source_class", default=None)
+    r_f.add_argument("--note", default=None)
+    r_im = rsub.add_parser("import", help="validate + import a role's JSON output")
+    r_im.add_argument("--case", required=True)
+    r_im.add_argument("--role", required=True,
+                      choices=["search", "constructive", "adversarial",
+                               "rebuttal", "semantic_review", "adjudicator"])
+    r_im.add_argument("file")
+    r_im.add_argument("--model-id", dest="model_id", required=True)
+    r_im.add_argument("--provider", required=True)
+    r_im.add_argument("--runtime", required=True)
+    r_im.add_argument("--tokens-in", dest="tokens_in", type=int, default=None)
+    r_im.add_argument("--tokens-out", dest="tokens_out", type=int, default=None)
+    r_im.add_argument("--cost-usd", dest="cost_usd", type=float, default=None)
+    r_d = rsub.add_parser("dossier", help="freeze the zh dossier for a final case")
+    r_d.add_argument("--case", required=True)
+    rsub.add_parser("rank", help="run-level opportunity output: qualified +"
+                                 " ranked best-available (H1.1)")
+    r_vb = rsub.add_parser("verify-bundle", help="recompute a frozen bundle's"
+                                                 " hashes; detect mutation")
+    r_vb.add_argument("--case", required=True)
+    rs.set_defaults(func=cmd_research)
 
     st = sub.add_parser("status", help="table counts and manifest quality summary")
     st.set_defaults(func=cmd_status)
