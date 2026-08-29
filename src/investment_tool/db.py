@@ -285,6 +285,7 @@ CREATE TABLE IF NOT EXISTS claim(
                               -- RECOMPUTE_MISMATCH|CONFLICTED|JUDGMENT_LINKED|
                               -- JUDGMENT_UNANCHORED
   verification_note TEXT,
+  verification_detail TEXT,   -- JSON: quote/temporal/source-class/semantic axes
   superseded_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_claim_case ON claim(case_id, role);
@@ -307,6 +308,12 @@ CREATE TABLE IF NOT EXISTS agent_run(
   note TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agentrun_case ON agent_run(case_id, role);
+CREATE TABLE IF NOT EXISTS case_evidence(
+  case_id TEXT NOT NULL,
+  evidence_id TEXT NOT NULL,
+  added_at_utc TEXT NOT NULL,
+  PRIMARY KEY(case_id, evidence_id)
+);
 CREATE TABLE IF NOT EXISTS schema_migration(
   migration_id TEXT PRIMARY KEY,
   applied_at_utc TEXT NOT NULL
@@ -421,6 +428,9 @@ ADDITIVE_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
         ("content_path", "TEXT"),
         ("access_note", "TEXT"),
     ),
+    "claim": (
+        ("verification_detail", "TEXT"),
+    ),
 }
 
 
@@ -469,6 +479,21 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
         " VALUES('h1_research_foundation', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
     )
+    junction_done = conn.execute(
+        "SELECT 1 FROM schema_migration WHERE migration_id='h11_case_evidence'"
+    ).fetchone()
+    if junction_done is None:
+        # evidence becomes globally content-addressed; existing single-case
+        # linkage backfills into the junction (no rows are lost or moved)
+        conn.execute(
+            "INSERT OR IGNORE INTO case_evidence(case_id, evidence_id, added_at_utc)"
+            " SELECT case_id, evidence_id, first_seen_at_utc FROM evidence"
+            " WHERE case_id IS NOT NULL"
+        )
+        conn.execute(
+            "INSERT INTO schema_migration(migration_id, applied_at_utc)"
+            " VALUES('h11_case_evidence', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+        )
     lifecycle_done = conn.execute(
         "SELECT 1 FROM schema_migration WHERE migration_id='s1_artifact_lifecycle'"
     ).fetchone()

@@ -575,6 +575,10 @@ def cmd_research(args) -> int:
             tokens_out=args.tokens_out, cost_usd=args.cost_usd)
     elif args.rcmd == "dossier":
         out = research.freeze_dossier(conn, args.case)
+    elif args.rcmd == "rank":
+        out = research.rank_cases(conn)
+    elif args.rcmd == "verify-bundle":
+        out = research.verify_bundle(conn, args.case)
     else:  # pragma: no cover
         out = {"error": f"unknown research subcommand {args.rcmd}"}
     print(json_mod.dumps(out, ensure_ascii=False, indent=2, default=str))
@@ -713,7 +717,7 @@ def build_parser() -> argparse.ArgumentParser:
     r_ex.add_argument("--case", required=True)
     r_ex.add_argument("--role", required=True,
                       choices=["search", "constructive", "adversarial",
-                               "rebuttal", "adjudicator"])
+                               "rebuttal", "semantic_review", "adjudicator"])
     r_f = rsub.add_parser("fetch", help="capture one URL as case evidence"
                                         " (the ONLY road from web to evidence)")
     r_f.add_argument("url")
@@ -727,7 +731,7 @@ def build_parser() -> argparse.ArgumentParser:
     r_im.add_argument("--case", required=True)
     r_im.add_argument("--role", required=True,
                       choices=["search", "constructive", "adversarial",
-                               "rebuttal", "adjudicator"])
+                               "rebuttal", "semantic_review", "adjudicator"])
     r_im.add_argument("file")
     r_im.add_argument("--model-id", dest="model_id", required=True)
     r_im.add_argument("--provider", required=True)
@@ -737,6 +741,11 @@ def build_parser() -> argparse.ArgumentParser:
     r_im.add_argument("--cost-usd", dest="cost_usd", type=float, default=None)
     r_d = rsub.add_parser("dossier", help="freeze the zh dossier for a final case")
     r_d.add_argument("--case", required=True)
+    rsub.add_parser("rank", help="run-level opportunity output: qualified +"
+                                 " ranked best-available (H1.1)")
+    r_vb = rsub.add_parser("verify-bundle", help="recompute a frozen bundle's"
+                                                 " hashes; detect mutation")
+    r_vb.add_argument("--case", required=True)
     rs.set_defaults(func=cmd_research)
 
     st = sub.add_parser("status", help="table counts and manifest quality summary")

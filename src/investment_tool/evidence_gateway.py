@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
+from pathlib import Path
 from urllib.parse import urlparse
 
 from investment_tool import us_filing_docs
@@ -106,22 +107,35 @@ def capture(conn: sqlite3.Connection, cfg, case_id: str, url: str, *,
     text = us_filing_docs.extract_text(payload, limit=250000)
     sha = hashlib.sha256(payload).hexdigest()
     evidence_id = f"evd_{sha[:16]}"
-    path = evidence_dir(case_id) / f"{evidence_id}.txt"
-    path.write_text(text)
     cls = source_class or classify_domain(url)
     now = utc_now()
-    conn.execute(
-        "INSERT OR REPLACE INTO evidence(evidence_id, event_id, case_id,"
-        " source_url, publisher_domain, published_at_utc, retrieved_at_utc,"
-        " first_seen_at_utc, sha256, retention_class, excerpt, dims_json,"
-        " title, source_class, content_path, access_note)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (evidence_id, None, case_id, url, urlparse(url).hostname,
-         published_at_utc, now, now, sha,
-         "OFFICIAL_FULL" if cls in ("PRIMARY_REGULATORY", "ISSUER")
-         else "MEDIA_EXCERPT",
-         text[:500], '{"gateway": "h1"}', title, cls, str(path), note),
-    )
+    existing = conn.execute("SELECT evidence_id, content_path FROM evidence"
+                            " WHERE evidence_id=?", (evidence_id,)).fetchone()
+    if existing:
+        # globally content-addressed and IMMUTABLE: the same content captured
+        # again (any case) only gains a case association — the original row,
+        # its first_seen_at_utc, and its stored text are never rewritten
+        path = existing["content_path"]
+        if path and not Path(path).exists():
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(text)
+    else:
+        path = evidence_dir(case_id) / f"{evidence_id}.txt"
+        path.write_text(text)
+        conn.execute(
+            "INSERT INTO evidence(evidence_id, event_id, case_id,"
+            " source_url, publisher_domain, published_at_utc, retrieved_at_utc,"
+            " first_seen_at_utc, sha256, retention_class, excerpt, dims_json,"
+            " title, source_class, content_path, access_note)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (evidence_id, None, case_id, url, urlparse(url).hostname,
+             published_at_utc, now, now, sha,
+             "OFFICIAL_FULL" if cls in ("PRIMARY_REGULATORY", "ISSUER")
+             else "MEDIA_EXCERPT",
+             text[:500], '{"gateway": "h1"}', title, cls, str(path), note),
+        )
+    conn.execute("INSERT OR IGNORE INTO case_evidence(case_id, evidence_id,"
+                 " added_at_utc) VALUES(?,?,?)", (case_id, evidence_id, now))
     conn.commit()
     eligible = None
     if published_at_utc:
