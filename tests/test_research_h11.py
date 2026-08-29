@@ -302,3 +302,40 @@ def test_rank_output_with_zero_qualified_but_best_available(conn, cfg, tmp_path)
     assert out["qualified"] == []
     assert len(out["best_available"]) == 1
     assert out["best_available"][0]["state"] == "BEST_AVAILABLE_WATCH"
+
+
+def test_claim_level_abs_ratio_derivation(conn, cfg, tmp_path):
+    """Run-discovered fix: NUMERIC claims (not only adjudicator reasons) may
+    recompute through an abs_ratio derivation; a conflicting value rejects."""
+    case = _open(conn, cfg)
+    _capture(conn, cfg, case["case_id"])
+    (research.case_dir(case["case_id"]) / "quantpack_latest.json").write_text(
+        json.dumps({"event_mcap_change": {"abnormal_change_est": -150000000.0}}))
+    doc = {"role": "search", "search_state": "COMPLETE", "queries": ["q"],
+           "coverage": {"sec": "FOUND"}, "evidence_used": [],
+           "negative_findings": [
+               {"id": "n1", "type": "NUMERIC", "material": True,
+                "text": "缺口比率约 1.5", "value": 1.5,
+                "derivation": {"op": "abs_ratio",
+                               "numerator_quant_ref":
+                                   "event_mcap_change.abnormal_change_est",
+                               "denominator_value": 100000000.0}}],
+           "competing_explanations": [], "new_questions": []}
+    out = _import(conn, cfg, case["case_id"], "search", doc, tmp_path)
+    assert out["status"] == "IMPORTED"
+    assert out["claim_states"].get("RECOMPUTED_OK") == 1
+    doc["negative_findings"][0]["id"] = "n2"
+    doc["negative_findings"][0]["value"] = 2.5      # conflicts with 1.5
+    out = _import(conn, cfg, case["case_id"], "search", doc, tmp_path)
+    assert out["status"] == "REJECTED_IMPORT"
+    assert any("abs_ratio" in p for p in out["problems"])
+
+
+def test_dossier_freezes_for_new_final_states(conn, cfg, tmp_path):
+    """Run-discovered fix: freeze_dossier must accept the new FINAL_STATES."""
+    case = _open(conn, cfg)
+    conn.execute("UPDATE research_case SET state='CONDITIONAL_CANDIDATE'"
+                 " WHERE case_id=?", (case["case_id"],))
+    conn.commit()
+    out = research.freeze_dossier(conn, case["case_id"])
+    assert "artifact_id" in out
