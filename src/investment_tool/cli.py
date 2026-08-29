@@ -499,6 +499,32 @@ def cmd_research_queue(args) -> int:
     return 0
 
 
+def cmd_us_sync_daily(args) -> int:
+    import json as json_mod
+
+    from investment_tool import us_soak
+
+    conn = connect()
+    cfg = _cfg(conn)
+    if args.list_pending:
+        print(json_mod.dumps({"pending": us_soak.pending_sync_dates(conn)}, indent=2))
+        return 0
+    ledger = us_soak.run_daily(conn, cfg, verify_date=args.verify_idempotency)
+    print(json_mod.dumps(ledger, ensure_ascii=False, indent=2, default=str))
+    return 0 if not ledger["errors"] else 2
+
+
+def cmd_soak_report(args) -> int:
+    import json as json_mod
+
+    from investment_tool import us_soak
+
+    conn = connect()
+    report = us_soak.soak_report(conn)
+    print(json_mod.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["gates"]["all_passed"] else 2
+
+
 def cmd_status(args) -> int:
     conn = connect()
     for table in ("company", "listing", "manifest", "security_day", "announcement",
@@ -602,6 +628,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="process the N best-ranked pending items")
     rq.add_argument("--limit", type=int, default=50, help="rows to list")
     rq.set_defaults(func=cmd_research_queue)
+
+    sd = sub.add_parser("us-sync-daily",
+                        help="scheduled catch-up: sync pending SEC filing days,"
+                             " poll halts, append the soak ledger (ingestion only)")
+    sd.add_argument("--list-pending", action="store_true",
+                    help="only list pending filing dates, no fetches")
+    sd.add_argument("--verify-idempotency", metavar="DATE", default=None,
+                    help="also re-sync DATE and prove nothing mutates")
+    sd.set_defaults(func=cmd_us_sync_daily)
+
+    sr = sub.add_parser("soak-report",
+                        help="aggregate soak ledgers and evaluate the live-gate"
+                             " criteria (PR-G)")
+    sr.set_defaults(func=cmd_soak_report)
 
     st = sub.add_parser("status", help="table counts and manifest quality summary")
     st.set_defaults(func=cmd_status)
