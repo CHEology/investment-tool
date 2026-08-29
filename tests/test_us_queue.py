@@ -16,7 +16,7 @@ from investment_tool import ranking, us_queue
 
 @pytest.fixture
 def tcfg():
-    return config_mod.load("us_trial_v0.2")
+    return config_mod.load("us_trial_v0.4")
 
 
 def _mk_company(conn, cid, ticker, lid):
@@ -165,7 +165,7 @@ def test_budget_goes_to_best_ranked_not_first_seen(conn, tcfg, tmp_path, monkeyp
     assert weak["state"] == "US_TRIAL_RESEARCH_PENDING"  # deferred, not dropped
     q = {r["ticker"]: r for r in conn.execute(
         "SELECT ticker, state, rank_score FROM research_queue").fetchall()}
-    assert q["ZZS"]["state"] == "RESEARCH_COMPLETED"
+    assert q["ZZS"]["state"] == "DOC_REVIEW_COMPLETED"
     assert q["AAW"]["state"] == "RESEARCH_PENDING"
     assert q["ZZS"]["rank_score"] > q["AAW"]["rank_score"]
 
@@ -178,10 +178,10 @@ def test_enqueue_never_downgrades_terminal_states(conn):
     kw = dict(event_id="ev1", candidate_id="c1", company_id="US:TT",
               listing_id="NASDAQ:TT", ticker="TT", asof="2026-08-28",
               config_version="us_trial_v0.1")
-    us_queue.enqueue(conn, state="RESEARCH_COMPLETED", rank={"score": 0.5}, **kw)
+    us_queue.enqueue(conn, state="DOC_REVIEW_COMPLETED", rank={"score": 0.5}, **kw)
     us_queue.enqueue(conn, state="RESEARCH_PENDING", rank={"score": 0.9}, **kw)
     row = conn.execute("SELECT state, rank_score FROM research_queue").fetchone()
-    assert row["state"] == "RESEARCH_COMPLETED"   # protected
+    assert row["state"] == "DOC_REVIEW_COMPLETED"   # protected
     assert row["rank_score"] == 0.9               # rank still refreshes
     # non-terminal states do move
     us_queue.enqueue(conn, state="FETCH_FAILED", rank={"score": 0.9},
@@ -213,7 +213,7 @@ def test_process_queue_resumes_and_upgrades_candidate(conn, tcfg, tmp_path, monk
     assert json.loads(weak["profile_json"])["content"]["primary"] == "management_change"
     q = conn.execute("SELECT state, attempts FROM research_queue"
                      " WHERE ticker='AAW'").fetchone()
-    assert q["state"] == "RESEARCH_COMPLETED" and q["attempts"] == 1
+    assert q["state"] == "DOC_REVIEW_COMPLETED" and q["attempts"] == 1
     # nothing left to process; rerun is a no-op
     audit2 = us_queue.process_queue(conn, tcfg, limit=5,
                                     http_factory=lambda: object())

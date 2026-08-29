@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from investment_tool import calendars_us, us_cli
@@ -27,6 +27,7 @@ from investment_tool.lineage import utc_now
 EVENING_INDEX_READY_ET = 18  # hours
 
 SOAK_DIR_NAME = "soak"
+DRILL_VALIDITY_DAYS = 30   # a passed drill certifies its code path this long
 
 
 def _soak_dir():
@@ -93,10 +94,14 @@ def verify_idempotency(conn: sqlite3.Connection, cfg, date: str) -> dict:
 
 
 def run_daily(conn: sqlite3.Connection, cfg, now_utc: str | None = None,
-              lookback_sessions: int = 5, verify_date: str | None = None) -> dict:
+              lookback_sessions: int = 5, verify_date: str | None = None,
+              origin: str = "MANUAL") -> dict:
     """The scheduled catch-up: sync every pending date, poll halts, optionally
-    run one idempotency verification, and append a soak ledger entry."""
+    run one idempotency verification, and append a soak ledger entry.
+    `origin` distinguishes SCHEDULED (launchd) from MANUAL runs — the soak
+    acceptance gate requires at least one SCHEDULED run (H0/F15)."""
     ledger: dict = {"generated_at": utc_now(), "kind": "US_SOAK_DAILY",
+                    "origin": origin,
                     "pending_before": [], "synced": [], "errors": [],
                     "halts": None, "idempotency": None}
     pending = pending_sync_dates(conn, now_utc, lookback_sessions)
@@ -148,38 +153,95 @@ def _poll_halts(conn: sqlite3.Connection, cfg) -> dict:
     return nasdaq_halts.route_halts(conn, nasdaq_halts.parse_halts(resp.content))
 
 
-def soak_report(conn: sqlite3.Connection, window_days: int = 7) -> dict:
-    """Aggregate the soak ledgers and evaluate the DESIGN live-gate criteria:
-    >=3 filing days ingested COMPLETE, >=1 amendment linked (naturally or via
-    the labeled fixture drill), >=1 idempotency verification, >=1
-    crash-recovery drill. Reports evidence, never asserts beyond it."""
+def soak_report(conn: sqlite3.Connection, window_days: int = 10) -> dict:
+    """Aggregate the soak ledgers and evaluate the corrected acceptance gate
+    (H0/F15). Only IN-WINDOW ledger evidence counts — never pre-soak database
+    history. Gates: ledger entries on >=5 distinct calendar days; >=3 filing
+    days INDEX_RECONCILED by in-window ledgers; >=1 SCHEDULED (launchd) run;
+    >=1 in-window idempotency verification; zero unresolved errors (an error
+    for date D is resolved by a later in-window ledger reconciling D);
+    amendment case (natural LINKED_UNIQUE or labeled fixture drill) and
+    crash-recovery drill on record. `window_days` bounds the evidence window,
+    measured back from the newest ledger entry."""
     ledgers = sorted(_soak_dir().glob("us_soak_*.json"))
     entries = [json.loads(p.read_text()) for p in ledgers]
-    # only days whose evening index actually reconciled count as synced —
-    # an attempted-but-PENDING day must not inflate the coverage claim
-    synced_dates = sorted({s["date"] for e in entries for s in e.get("synced", [])
-                           if "INDEX_RECONCILED" in str(s.get("us_completeness"))}
-                          | synced_index_dates(conn))
+    if entries:
+        latest = max(e["generated_at"] for e in entries)
+        latest_d = datetime.strptime(latest, "%Y-%m-%dT%H:%M:%SZ")
+        floor = (latest_d - timedelta(days=window_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        entries = [e for e in entries if e["generated_at"] >= floor]
+    ledger_days = sorted({e["generated_at"][:10] for e in entries})
+    synced_ok: dict[str, str] = {}
+    for e in entries:
+        for s in e.get("synced", []):
+            if "INDEX_RECONCILED" in str(s.get("us_completeness")):
+                synced_ok[s["date"]] = max(synced_ok.get(s["date"], ""),
+                                           e["generated_at"])
+    unresolved_errors = []
+    for e in entries:
+        for err in e.get("errors", []):
+            d = err.get("date")
+            resolved = (d is not None and d in synced_ok
+                        and synced_ok[d] > e["generated_at"])
+            if not resolved:
+                unresolved_errors.append({"at": e["generated_at"], **err})
+    scheduled = [e for e in entries if e.get("origin") == "SCHEDULED"]
+    idem = [e["idempotency"] for e in entries
+            if e.get("idempotency") and e["idempotency"].get("idempotent")]
     amendments_natural = conn.execute(
         "SELECT COUNT(*) FROM sec_filing WHERE is_amendment=1"
         " AND amend_link_state='LINKED_UNIQUE'").fetchone()[0]
-    drills = sorted(_soak_dir().glob("amendment_drill_*.json"))
-    recoveries = sorted(_soak_dir().glob("recovery_drill_*.json"))
-    idem = [e["idempotency"] for e in entries
-            if e.get("idempotency") and e["idempotency"].get("idempotent")]
+    # Drills are DURABLE certification evidence with explicit validity: a
+    # passed drill certifies the code path for DRILL_VALIDITY_DAYS from its
+    # own generated_at, independent of the ledger window — but an expired or
+    # failed drill never satisfies the gate (H0.1/F-D).
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    def _valid_drills(pattern: str) -> tuple[list[dict], list[dict]]:
+        valid, expired = [], []
+        for p in sorted(_soak_dir().glob(pattern)):
+            try:
+                d = json.loads(p.read_text())
+            except json.JSONDecodeError:
+                continue
+            gen = d.get("generated_at")
+            passed = bool(d.get("passed", True))
+            age_days = None
+            if gen:
+                age_days = (now - datetime.strptime(
+                    gen, "%Y-%m-%dT%H:%M:%SZ")).days
+            row = {"file": p.name, "generated_at": gen, "passed": passed,
+                   "age_days": age_days}
+            if passed and age_days is not None and age_days <= DRILL_VALIDITY_DAYS:
+                valid.append(row)
+            else:
+                expired.append(row)
+        return valid, expired
+
+    drills, drills_expired = _valid_drills("amendment_drill_*.json")
+    recoveries, recoveries_expired = _valid_drills("recovery_drill_*.json")
     report = {
         "generated_at": utc_now(),
-        "ledger_entries": len(entries),
-        "filing_days_synced": synced_dates,
-        "amendments_linked_natural": amendments_natural,
-        "amendment_drills": [p.name for p in drills],
-        "recovery_drills": [p.name for p in recoveries],
+        "window_days": window_days,
+        "ledger_entries_in_window": len(entries),
+        "ledger_calendar_days": ledger_days,
+        "filing_days_synced_in_window": sorted(synced_ok),
+        "scheduled_runs": len(scheduled),
         "idempotency_verifications_passed": len(idem),
-        "errors_recorded": sum(len(e.get("errors", [])) for e in entries),
+        "unresolved_errors": unresolved_errors,
+        "amendments_linked_natural": amendments_natural,
+        "amendment_drills_valid": drills,
+        "amendment_drills_expired_or_failed": drills_expired,
+        "recovery_drills_valid": recoveries,
+        "recovery_drills_expired_or_failed": recoveries_expired,
+        "drill_validity_days": DRILL_VALIDITY_DAYS,
         "gates": {
-            "min_3_filing_days": len(synced_dates) >= 3,
-            "amendment_case": amendments_natural >= 1 or len(drills) >= 1,
+            "min_5_ledger_calendar_days": len(ledger_days) >= 5,
+            "min_3_filing_days_in_window": len(synced_ok) >= 3,
+            "scheduled_run_observed": len(scheduled) >= 1,
             "idempotency_verified": len(idem) >= 1,
+            "zero_unresolved_errors": len(unresolved_errors) == 0,
+            "amendment_case": amendments_natural >= 1 or len(drills) >= 1,
             "crash_recovery_drilled": len(recoveries) >= 1,
         },
     }

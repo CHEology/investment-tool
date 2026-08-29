@@ -229,7 +229,7 @@ CREATE TABLE IF NOT EXISTS research_queue(
   ticker TEXT,
   asof TEXT NOT NULL,
   state TEXT NOT NULL,      -- RESEARCH_PENDING | RESEARCH_IN_PROGRESS |
-                            -- RESEARCH_COMPLETED | FETCH_FAILED |
+                            -- DOC_REVIEW_COMPLETED | FETCH_FAILED |
                             -- DATA_UNAVAILABLE | REJECTED | SUPERSEDED
   rank_score REAL,
   rank_version TEXT,
@@ -379,6 +379,18 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
         " VALUES('pr_a_research_queue', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
     )
+    rename_done = conn.execute(
+        "SELECT 1 FROM schema_migration WHERE migration_id='h0_doc_review_rename'"
+    ).fetchone()
+    if rename_done is None:
+        conn.execute(
+            "UPDATE research_queue SET state='DOC_REVIEW_COMPLETED'"
+            " WHERE state='RESEARCH_COMPLETED'"
+        )
+        conn.execute(
+            "INSERT INTO schema_migration(migration_id, applied_at_utc)"
+            " VALUES('h0_doc_review_rename', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+        )
     lifecycle_done = conn.execute(
         "SELECT 1 FROM schema_migration WHERE migration_id='s1_artifact_lifecycle'"
     ).fetchone()

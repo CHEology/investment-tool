@@ -150,6 +150,7 @@ _US_STATE_ZH = {
     "US_TRIAL_FETCH_FAILED": "文档获取失败（待重试）",
     "US_TRIAL_INSUFFICIENT_DATA": "数据不足",
     "US_TRIAL_POST_EVENT_PENDING": "事件会话晚于评估日（待价格）",
+    "US_TRIAL_PARTIAL_PRECISION": "部分精度触发（盘中披露/日期精度，污染腿无干净佐证；复核轨）",
     "US_TRIAL_OBSERVED_POSITIVE_MOVE": "正向异动观察（非负面通道候选；供未来正意外通道）",
     "US_TRIAL_EPISODE_MEMBER": "事件簇成员（见主事件，避免同一事件簇重复线索）",
 }

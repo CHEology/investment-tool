@@ -7,7 +7,7 @@ processing reuses the reaction profile frozen at the original asof (prices
 are never recomputed with later data, so the gate basis stays time-consistent
 with the run that triggered it).
 
-States: RESEARCH_PENDING | RESEARCH_IN_PROGRESS | RESEARCH_COMPLETED |
+States: RESEARCH_PENDING | RESEARCH_IN_PROGRESS | DOC_REVIEW_COMPLETED |
 FETCH_FAILED | DATA_UNAVAILABLE | REJECTED | SUPERSEDED. Terminal states
 (COMPLETED/REJECTED/SUPERSEDED) are never overwritten by a re-run's enqueue.
 """
@@ -21,7 +21,7 @@ import uuid
 from investment_tool.db import DEFAULT_DATA_DIR
 from investment_tool.lineage import utc_now
 
-PROTECTED_STATES = ("RESEARCH_COMPLETED", "REJECTED", "SUPERSEDED")
+PROTECTED_STATES = ("DOC_REVIEW_COMPLETED", "REJECTED", "SUPERSEDED")
 
 
 def queue_id(event_id: str, listing_id: str) -> str:
@@ -141,7 +141,7 @@ def process_queue(conn: sqlite3.Connection, trial_cfg, limit: int,
         us_trial._upsert_candidate(conn, ev["company_id"], state, new_profile,
                                    trial_cfg.id)
         if content_state == us_trial.CONTENT_REVIEWED:
-            _set_state(conn, ev["queue_id"], "RESEARCH_COMPLETED", bump_attempts=True)
+            _set_state(conn, ev["queue_id"], "DOC_REVIEW_COMPLETED", bump_attempts=True)
         else:
             _set_state(conn, ev["queue_id"], "FETCH_FAILED", bump_attempts=True,
                        last_error=err or "document fetch failed")

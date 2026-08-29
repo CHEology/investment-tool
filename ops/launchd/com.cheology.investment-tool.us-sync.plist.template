@@ -11,6 +11,7 @@
     <string>-m</string>
     <string>investment_tool.cli</string>
     <string>us-sync-daily</string>
+    <string>--scheduled</string>
   </array>
   <key>WorkingDirectory</key>
   <string>__REPO__</string>

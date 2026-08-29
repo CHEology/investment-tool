@@ -459,10 +459,10 @@ def cmd_trial(args) -> int:
         return 1
     conn = connect()
     cfg = _cfg(conn)
-    trial_cfg = config_mod2.load("us_trial_v0.2")
+    trial_cfg = config_mod2.load("us_trial_v0.4")
     config_mod2.register(conn, trial_cfg,
-                         changelog="US trial v0.2: event-anchored gates, dual time"
-                                   " anchors, episode consolidation (PR-B)")
+                         changelog="US trial v0.3: contamination-aware gates,"
+                                   " bounded event lookback (H0)")
     summary = us_trial.run_trial(conn, cfg, trial_cfg, args.asof)
     frozen = []
     for c in summary["leads"]:
@@ -484,18 +484,27 @@ def cmd_research_queue(args) -> int:
 
     conn = connect()
     if args.process:
-        trial_cfg = config_mod2.load("us_trial_v0.2")
+        trial_cfg = config_mod2.load("us_trial_v0.4")
         config_mod2.register(conn, trial_cfg,
-                             changelog="US trial v0.2: event-anchored gates, dual time"
-                                       " anchors, episode consolidation (PR-B)")
+                             changelog="US trial v0.3: contamination-aware gates,"
+                                       " bounded event lookback (H0)")
         audit = us_queue.process_queue(conn, trial_cfg, args.process)
         print(json_mod.dumps(audit, ensure_ascii=False, indent=2, default=str))
         return 0
     rows = us_queue.pending(conn, args.limit)
     counts = conn.execute(
         "SELECT state, COUNT(*) AS n FROM research_queue GROUP BY state").fetchall()
-    print(json_mod.dumps({"states": {r["state"]: r["n"] for r in counts},
-                          "next_by_rank": rows}, ensure_ascii=False, indent=2))
+    out = {"states": {r["state"]: r["n"] for r in counts}, "next_by_rank": rows}
+    # H0/F16: pending candidates with an empty queue means the queue was
+    # never backfilled — warn loudly instead of silently doing nothing
+    orphans = conn.execute(
+        "SELECT COUNT(*) FROM candidate WHERE state IN"
+        " ('US_TRIAL_RESEARCH_PENDING','US_TRIAL_FETCH_FAILED')").fetchone()[0]
+    queued = sum(out["states"].values())
+    if orphans and not queued:
+        out["warning"] = (f"{orphans} pending candidates exist but research_queue"
+                          " is empty — run scripts/backfill_research_queue.py")
+    print(json_mod.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -509,7 +518,8 @@ def cmd_us_sync_daily(args) -> int:
     if args.list_pending:
         print(json_mod.dumps({"pending": us_soak.pending_sync_dates(conn)}, indent=2))
         return 0
-    ledger = us_soak.run_daily(conn, cfg, verify_date=args.verify_idempotency)
+    ledger = us_soak.run_daily(conn, cfg, verify_date=args.verify_idempotency,
+                               origin="SCHEDULED" if args.scheduled else "MANUAL")
     print(json_mod.dumps(ledger, ensure_ascii=False, indent=2, default=str))
     return 0 if not ledger["errors"] else 2
 
@@ -636,6 +646,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="only list pending filing dates, no fetches")
     sd.add_argument("--verify-idempotency", metavar="DATE", default=None,
                     help="also re-sync DATE and prove nothing mutates")
+    sd.add_argument("--scheduled", action="store_true",
+                    help="mark this run as launchd-scheduled in the soak ledger")
     sd.set_defaults(func=cmd_us_sync_daily)
 
     sr = sub.add_parser("soak-report",

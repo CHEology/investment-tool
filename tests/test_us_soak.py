@@ -86,28 +86,10 @@ def test_partial_then_full_run_recovers_and_preserves_first_seen(conn):
     assert conn.execute("SELECT COUNT(*) FROM sec_filing").fetchone()[0] > len(early)
 
 
-def test_soak_report_gates(conn, tmp_path):
-    """The report only passes with >=3 filing days, an amendment case,
-    an idempotency verification, and a recovery drill on record."""
+def test_soak_report_gates_require_window_evidence(conn, tmp_path):
+    """Superseded by the H0/F15 gate rework: an empty soak must fail, and the
+    full acceptance path is covered in tests/test_h0_corrections.py."""
     report = us_soak.soak_report(conn)
     assert report["gates"]["all_passed"] is False
-    # three synced days + a natural amendment via the fixture pipeline
-    cfg = _cfg()
-    us_cli.run_us_sync(conn, cfg, "2026-08-27", str(FIX / "master_sample.idx"),
-                       str(FIX / "efts_8k_sample.json"),
-                       [str(FIX / "submissions_sample.json")], None)
-    _mark_synced(conn, "2026-08-25")
-    _mark_synced(conn, "2026-08-26")
-    _mark_synced(conn, "2026-08-27")
-    soak_dir = tmp_path / "audit" / "soak"
-    soak_dir.mkdir(parents=True, exist_ok=True)
-    (soak_dir / "us_soak_20260828T000000Z.json").write_text(json.dumps(
-        {"idempotency": {"idempotent": True}, "errors": [], "synced": []}))
-    (soak_dir / "recovery_drill_20260828T000000Z.json").write_text(
-        json.dumps({"passed": True}))
-    report = us_soak.soak_report(conn)
-    assert report["gates"]["min_3_filing_days"] is True
-    assert report["gates"]["amendment_case"] is True      # LINKED_UNIQUE from fixtures
-    assert report["gates"]["idempotency_verified"] is True
-    assert report["gates"]["crash_recovery_drilled"] is True
-    assert report["gates"]["all_passed"] is True
+    assert report["gates"]["min_5_ledger_calendar_days"] is False
+    assert report["gates"]["scheduled_run_observed"] is False

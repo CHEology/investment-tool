@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import UTC, datetime, timedelta
 
 from investment_tool.lineage import utc_now
 
@@ -214,44 +213,6 @@ def link_amendments(conn: sqlite3.Connection) -> dict:
         hist[state] += 1
     conn.commit()
     return hist
-
-
-def _next_weekday(d):
-    d = d + timedelta(days=1)
-    while d.weekday() >= 5:
-        d = d + timedelta(days=1)
-    return d
-
-
-def eligible_session_us(accepted_at_utc: str | None, filing_date: str | None) -> dict:
-    """US temporal eligibility from acceptance time, in real America/New_York
-    time (DST-correct via zoneinfo — never a hard-coded offset). Weekends roll
-    to the next weekday. US holidays and early closes are NOT yet modeled
-    (explicit session_calendar flag); a true session calendar arrives with the
-    US price slice. Replay visibility remains governed by first_seen_at_utc.
-    Same-session eligibility is flagged partial and must never be mixed with
-    full-session return windows."""
-    from zoneinfo import ZoneInfo
-
-    calendar_note = "WEEKDAY_APPROX_NO_HOLIDAYS"
-    if accepted_at_utc:
-        dt = datetime.strptime(accepted_at_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-        et = dt.astimezone(ZoneInfo("America/New_York"))
-        if et.weekday() >= 5:
-            d = _next_weekday(et.date())
-            return {"eligible_from_date": d.isoformat(), "precision": "TIME",
-                    "same_session_partial": False, "session_calendar": calendar_note}
-        if et.hour < 16:
-            return {"eligible_from_date": et.date().isoformat(), "precision": "TIME",
-                    "same_session_partial": True, "session_calendar": calendar_note}
-        return {"eligible_from_date": _next_weekday(et.date()).isoformat(),
-                "precision": "TIME", "same_session_partial": False,
-                "session_calendar": calendar_note}
-    if filing_date:
-        return {"eligible_from_date": filing_date, "precision": "DATE",
-                "same_session_partial": None, "session_calendar": calendar_note}
-    return {"eligible_from_date": None, "precision": "UNKNOWN",
-            "same_session_partial": None, "session_calendar": calendar_note}
 
 
 def propagate_enrichment(conn: sqlite3.Connection) -> dict:

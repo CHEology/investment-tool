@@ -94,6 +94,23 @@ def compute_event_reaction(conn: sqlite3.Connection, listing_id: str,
     out["car5"] = _ret(series[i0 - 1][1], series[i5][1])
     out["mkt_adj_car5"] = _madj(out["car5"], spy, base_d, dates[i5])
     out["car5_window_sessions"] = i5 - i0 + 1
+    # clean post-disclosure legs: measured FROM the event-session close
+    # forward, so they can never contain pre-release trading even when the
+    # release was intra-session (H0/F13; loophole fix H0.1 — car5 contains
+    # the event session and is therefore NOT clean)
+    if i0 + 1 < len(series):
+        out["next_ret1"] = _ret(series[i0][1], series[i0 + 1][1])
+        out["mkt_adj_next_ret1"] = _madj(out["next_ret1"], spy, evt_d, dates[i0 + 1])
+    else:
+        out["next_ret1"] = out["mkt_adj_next_ret1"] = None
+    i3 = min(i0 + 3, len(series) - 1)
+    if i3 > i0:
+        out["post_car3"] = _ret(series[i0][1], series[i3][1])
+        out["mkt_adj_post_car3"] = _madj(out["post_car3"], spy, evt_d, dates[i3])
+        out["post_car3_window_sessions"] = i3 - i0
+    else:
+        out["post_car3"] = out["mkt_adj_post_car3"] = None
+        out["post_car3_window_sessions"] = 0
     out["post_cum"] = _ret(series[i0 - 1][1], series[-1][1])
     out["mkt_adj_post_cum"] = _madj(out["post_cum"], spy, base_d, dates[-1])
     vols = [v for _d, _p, v in series[max(0, i0 - 20):i0] if v]
