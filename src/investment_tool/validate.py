@@ -22,8 +22,19 @@ from investment_tool.lineage import utc_now
 WINDOWS = (30, 90, 180, 365)
 
 
-def _beijing_date(ts_utc: str) -> str:
+US_EXCHANGES = ("NASDAQ", "NYSE", "AMEX")
+
+
+def _freeze_local_date(ts_utc: str, exchange: str | None) -> str:
+    """Freeze-date in the LISTING's market timezone (H0 correction of the
+    Beijing-only anchor): US listings use America/New_York, A-share listings
+    keep UTC+8. The first tracked session is the first trade date strictly
+    after this local date."""
+    from zoneinfo import ZoneInfo
+
     dt = datetime.strptime(ts_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    if exchange in US_EXCHANGES:
+        return dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     return (dt + timedelta(hours=8)).strftime("%Y-%m-%d")
 
 
@@ -91,13 +102,14 @@ def _snapshot_for(conn, cand: sqlite3.Row, asof: str) -> dict:
         return {"state": "EXCLUDED_INVALIDATED", "artifact_status": "INVALIDATED",
                 "note": "visible in the ledger; never a control observation"}
     listing = conn.execute(
-        "SELECT listing_id FROM listing WHERE company_id=? ORDER BY listing_id LIMIT 1",
+        "SELECT listing_id, exchange FROM listing WHERE company_id=?"
+        " ORDER BY listing_id LIMIT 1",
         (cand["company_id"],)
     ).fetchone()
     if listing is None:
         return {"state": "NO_LISTING"}
     lid = listing["listing_id"]
-    frozen_date = _beijing_date(cand["frozen_at_utc"])
+    frozen_date = _freeze_local_date(cand["frozen_at_utc"], listing["exchange"])
     ref_row = conn.execute(
         "SELECT MIN(trade_date) AS d FROM security_day WHERE listing_id=? AND trade_date>?"
         " AND adj_close IS NOT NULL", (lid, frozen_date),
@@ -134,6 +146,21 @@ def _snapshot_for(conn, cand: sqlite3.Row, asof: str) -> dict:
         if len(finals) >= 2:
             peer_final = float(pd.Series(finals).median())
 
+    # market adjustment for US listings: same-window SPY return from
+    # benchmark_day (H0 correction — US snapshots previously had raw only)
+    mkt_adj = None
+    if listing["exchange"] in US_EXCHANGES:
+        spy = {
+            r["trade_date"]: float(r["close"]) for r in conn.execute(
+                "SELECT trade_date, close FROM benchmark_day WHERE index_id='SPY'"
+                " AND trade_date>=? AND trade_date<=? ORDER BY trade_date",
+                (ref_date, str(series.index[-1])),
+            )
+        }
+        b0, b1 = spy.get(str(series.index[0])), spy.get(str(series.index[-1]))
+        if b0 and b1:
+            mkt_adj = float(cum.iloc[-1]) - (b1 / b0 - 1.0)
+
     out = {
         "state": "TRACKED",
         "artifact_status": cand["status"],
@@ -142,6 +169,7 @@ def _snapshot_for(conn, cand: sqlite3.Row, asof: str) -> dict:
         "last_date": str(series.index[-1]),
         "sessions_elapsed": int(len(series) - 1),
         "ret_raw": float(cum.iloc[-1]),
+        "ret_mkt_adj": mkt_adj,
         "ret_peer_adj": (float(cum.iloc[-1]) - peer_final) if peer_final is not None else None,
         "peer_median_ret": peer_final,
         "mae_raw": float(cum.min()),

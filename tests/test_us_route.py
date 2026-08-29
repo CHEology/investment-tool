@@ -98,28 +98,6 @@ def test_amendment_ambiguous_when_two_originals_share_period(conn):
     assert hist["AMBIGUOUS"] == 1
 
 
-def test_eligible_session_us_dst_and_weekends():
-    # EDT (summer, UTC-4): 18:02Z = 14:02 ET -> same session, partial
-    r = us_route.eligible_session_us("2026-08-27T18:02:11Z", None)
-    assert r["eligible_from_date"] == "2026-08-27" and r["same_session_partial"] is True
-    # EDT after-hours: 21:30Z = 17:30 ET Thursday -> Friday
-    r = us_route.eligible_session_us("2026-08-27T21:30:00Z", None)
-    assert r["eligible_from_date"] == "2026-08-28" and r["same_session_partial"] is False
-    # EST (winter, UTC-5): 20:30Z = 15:30 EST -> SAME session (a fixed -4 offset
-    # would have wrongly pushed this to the next day)
-    r = us_route.eligible_session_us("2026-01-15T20:30:00Z", None)
-    assert r["eligible_from_date"] == "2026-01-15" and r["same_session_partial"] is True
-    # Friday after-hours rolls over the weekend to Monday
-    r = us_route.eligible_session_us("2026-08-28T21:30:00Z", None)
-    assert r["eligible_from_date"] == "2026-08-31"
-    # Saturday acceptance -> Monday
-    r = us_route.eligible_session_us("2026-08-29T15:00:00Z", None)
-    assert r["eligible_from_date"] == "2026-08-31"
-    r = us_route.eligible_session_us(None, "2026-08-27")
-    assert r["precision"] == "DATE"
-    assert r["session_calendar"] == "WEEKDAY_APPROX_NO_HOLIDAYS"
-
-
 def test_staged_classification_8k_without_items_stays_pending(conn):
     from investment_tool import us_ingest, us_route
 

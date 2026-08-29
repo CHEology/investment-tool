@@ -32,8 +32,16 @@ def _cutoff(asof: str) -> str:
     return f"{asof}T23:59:59Z"
 
 
-def select_events(conn: sqlite3.Connection, asof: str) -> list[dict]:
-    """US events visible by the cutoff, joined to company+listing+filing."""
+def select_events(conn: sqlite3.Connection, asof: str,
+                  lookback_days: int | None = None) -> list[dict]:
+    """US events visible by the cutoff, joined to company+listing+filing.
+    `lookback_days` bounds re-gating (H0/F17): events first seen more than
+    that many calendar days before asof are managed by the research queue
+    lifecycle instead of being re-triggered every run. None = unbounded."""
+    floor = "0000"
+    if lookback_days is not None:
+        floor = (date_cls.fromisoformat(asof)
+                 - timedelta(days=lookback_days)).isoformat() + "T00:00:00Z"
     rows = conn.execute(
         """
         SELECT e.event_id, e.type, e.published_at_utc, e.first_seen_at_utc,
@@ -47,10 +55,11 @@ def select_events(conn: sqlite3.Connection, asof: str) -> list[dict]:
         LEFT JOIN sec_filing f ON f.event_id = e.event_id
         WHERE (e.event_id LIKE 'ev_us_%' OR e.event_id LIKE 'ev_halt_%')
           AND e.first_seen_at_utc <= ?
+          AND e.first_seen_at_utc >= ?
           AND e.type IN ({})
         ORDER BY e.first_seen_at_utc
         """.format(",".join("?" * len(RELEVANT_TYPES))),
-        (_cutoff(asof), *RELEVANT_TYPES),
+        (_cutoff(asof), floor, *RELEVANT_TYPES),
     ).fetchall()
     out = []
     seen = set()
@@ -78,13 +87,18 @@ def event_anchors(ev: dict) -> dict:
 
 
 def evaluate_gates(rx: dict, tcfg) -> tuple[str, list[str]]:
-    """(TRIGGERED|POSITIVE_MOVE|NEAR_MISS|NO_TRIGGER|POST_EVENT_PENDING|
-    INSUFFICIENT_DATA, hits).
+    """(TRIGGERED|TRIGGERED_PARTIAL_PRECISION|POSITIVE_MOVE|NEAR_MISS|
+    NO_TRIGGER|POST_EVENT_PENDING|INSUFFICIENT_DATA, hits).
 
-    Every leg is EVENT-ANCHORED (us_trial_v0.2): the asof-trailing windows
-    that review F1 falsified are diagnostics only and can no longer trigger.
-    A positive event-session move is not discarded: it returns POSITIVE_MOVE
-    so discovery keeps it visible (future positive-surprise lane input)."""
+    Every leg is EVENT-ANCHORED. Contamination rule (H0/F13): when the event
+    window is contaminated — the release was intra-session, so the
+    close-to-close event return also contains pre-release trading, or the
+    anchor has only DATE precision — the evt1/volume legs are recorded as
+    *_contaminated and cannot trigger the lead track alone; a clean leg
+    (car5, or next1 = the session after the event session) must corroborate.
+    Contaminated legs without corroboration route to
+    TRIGGERED_PARTIAL_PRECISION (review track). A positive event-session
+    move is not discarded: POSITIVE_MOVE keeps it visible."""
     if rx.get("state") != "OK":
         return "INSUFFICIENT_DATA", []
     if rx.get("sessions", 0) < int(tcfg.value("data.min_price_sessions")):
@@ -94,18 +108,29 @@ def evaluate_gates(rx: dict, tcfg) -> tuple[str, list[str]]:
         return "POST_EVENT_PENDING", []
     if post_state != "OK":
         return "INSUFFICIENT_DATA", []
+    contaminated = bool(rx.get("event_window_contaminated")) or (
+        (rx.get("anchors") or {}).get("precision") == "DATE")
+    e1 = rx.get("mkt_adj_post_ret1")
     legs = {
-        "evt1": (rx.get("mkt_adj_post_ret1"),
-                 float(tcfg.value("triggers.mkt_adj_event_ret1_max"))),
+        "evt1": (e1, float(tcfg.value("triggers.mkt_adj_event_ret1_max"))),
         "car5": (rx.get("mkt_adj_car5"), float(tcfg.value("triggers.mkt_adj_car5_max"))),
     }
     hits = [name for name, (v, thr) in legs.items() if v is not None and v <= thr]
     vr = rx.get("volume_ratio")
-    e1 = rx.get("mkt_adj_post_ret1")
     if (vr is not None and e1 is not None
             and vr >= float(tcfg.value("triggers.volume_ratio_min"))
             and e1 <= float(tcfg.value("triggers.volume_event_ret1_max"))):
         hits.append("volume")
+    if contaminated:
+        hits = [f"{h}_contaminated" if h in ("evt1", "volume") else h for h in hits]
+        n1 = rx.get("mkt_adj_next_ret1")
+        if (n1 is not None
+                and n1 <= float(tcfg.value("triggers.mkt_adj_next_ret1_max"))):
+            hits.append("next1")
+        clean = [h for h in hits if not h.endswith("_contaminated")]
+        if hits and not clean:
+            return "TRIGGERED_PARTIAL_PRECISION", hits
+        hits = hits if clean else []
     if hits:
         return "TRIGGERED", hits
     if (e1 is not None and e1 >= float(tcfg.value("triggers.positive_move_min"))):
@@ -204,6 +229,9 @@ def assess_and_state(ev: dict, rx: dict, gate: str, hits: list[str], content: di
         return "US_TRIAL_INSUFFICIENT_DATA", profile
     if gate == "POST_EVENT_PENDING":
         return "US_TRIAL_POST_EVENT_PENDING", profile
+    if gate == "TRIGGERED_PARTIAL_PRECISION":
+        # contaminated legs without clean corroboration: review track only
+        return "US_TRIAL_PARTIAL_PRECISION", profile
     if gate == "POSITIVE_MOVE":
         # not excluded from discovery: recorded as an observation for a future
         # positive-surprise lane; the negative-reversal lane cannot admit it
@@ -238,15 +266,25 @@ def assess_and_state(ev: dict, rx: dict, gate: str, hits: list[str], content: di
     return "US_TRIAL_REJECTED_CONTENT_UNCLASSIFIED", profile
 
 
+# states that only reflect this run's budget/fetch situation — they must
+# never overwrite a substantive assessment from an earlier run (H0/F14)
+BUDGET_ARTIFACT_STATES = ("US_TRIAL_RESEARCH_PENDING", "US_TRIAL_FETCH_FAILED")
+OVERWRITABLE_BY_BUDGET = BUDGET_ARTIFACT_STATES + (
+    "US_TRIAL_INSUFFICIENT_DATA", "US_TRIAL_POST_EVENT_PENDING")
+
+
 def _upsert_candidate(conn, company_id: str, state: str, profile: dict, cfg_id: str) -> str:
     t0 = profile.get("reaction", {}).get("t0_session") or profile.get("event_id")
     existing = conn.execute(
-        "SELECT candidate_id FROM candidate WHERE company_id=? AND lane='A'"
+        "SELECT candidate_id, state FROM candidate WHERE company_id=? AND lane='A'"
         " AND json_extract(profile_json, '$.event_id')=?",
         (company_id, profile["event_id"]),
     ).fetchone()
     payload = json.dumps(profile, ensure_ascii=False, default=str)
     if existing:
+        if (state in BUDGET_ARTIFACT_STATES
+                and existing["state"] not in OVERWRITABLE_BY_BUDGET):
+            return existing["candidate_id"]   # no cross-day state regression
         conn.execute("UPDATE candidate SET state=?, profile_json=?, config_version=?"
                      " WHERE candidate_id=?",
                      (state, payload, cfg_id, existing["candidate_id"]))
@@ -258,6 +296,19 @@ def _upsert_candidate(conn, company_id: str, state: str, profile: dict, cfg_id: 
         (cid, company_id, "A", state, payload, json.dumps({"t0": t0}), utc_now(), cfg_id),
     )
     return cid
+
+
+def cached_content(conn: sqlite3.Connection, ev: dict) -> dict | None:
+    """Reuse an already-fetched primary document (immutable per accession)
+    without consuming any new-document budget (H0/F14)."""
+    if not ev.get("accession"):
+        return None
+    row = conn.execute("SELECT 1 FROM sec_filing_document WHERE accession=?",
+                       (ev["accession"],)).fetchone()
+    tp = us_filing_docs.text_path(ev["accession"])
+    if row and tp.exists():
+        return us_filing_docs.assess_content(tp.read_text(), ev["items_csv"])
+    return None
 
 
 def review_filing_content(conn: sqlite3.Connection, trial_cfg, http,
@@ -303,7 +354,11 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
     summary: dict = {"asof": asof, "generated_at": utc_now(), "config": trial_cfg.id,
                      "counts": {}, "leads": [], "near_misses": [],
                      "rejections": {}, "degraded": []}
-    events = select_events(conn, asof)
+    try:
+        lookback = int(trial_cfg.value("data.event_lookback_days"))
+    except KeyError:
+        lookback = None  # older configs: unbounded (historical replays)
+    events = select_events(conn, asof, lookback_days=lookback)
     summary["counts"]["events_considered"] = len(events)
 
     tickers_by_listing = {e["listing_id"]: e["ticker"] for e in events}
@@ -337,14 +392,21 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
 
     triggered = [e for e in evaluated if e["gate"] == "TRIGGERED" and _is_primary(e)]
     ranked = ranking.rank_events(triggered)
+    # cached documents are free (immutable per accession, H0/F14): the
+    # new-fetch budget applies only to events without a stored document
+    for e in ranked:
+        e["_cached_content"] = cached_content(conn, e)
     read_set = {id(e) for e in
-                [e for e in ranked if e["accession"] is not None][:content_cap]}
+                [e for e in ranked
+                 if e["accession"] is not None and e["_cached_content"] is None
+                 ][:content_cap]}
     summary["counts"]["ranked"] = len(ranked)
 
     # Pass 2 — content review for the read set; queue rows for every
     # triggered event so nothing disappears when the budget runs out.
     http = None
     docs_reviewed = 0
+    docs_reused = 0
     states: dict[str, int] = {}
     for ev in evaluated:
         rx, gate, hits = ev["rx"], ev["gate"], ev["hits"]
@@ -376,6 +438,10 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
                 content = {"primary": "regulatory_halt", "flags": [],
                            "content_version": us_filing_docs.CONTENT_VERSION}
                 content_state = CONTENT_REVIEWED
+            elif ev.get("_cached_content") is not None:
+                content = ev["_cached_content"]
+                content_state = CONTENT_REVIEWED
+                docs_reused += 1
             elif id(ev) in read_set:
                 if http is None:
                     http = http_factory()
@@ -398,7 +464,7 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
         cid = _upsert_candidate(conn, ev["company_id"], state, profile, trial_cfg.id)
         if gate == "TRIGGERED":
             queue_state = {
-                CONTENT_REVIEWED: "RESEARCH_COMPLETED",
+                CONTENT_REVIEWED: "DOC_REVIEW_COMPLETED",
                 CONTENT_BUDGET_DEFERRED: "RESEARCH_PENDING",
                 CONTENT_FETCH_FAILED: "FETCH_FAILED",
             }.get(content_state, "DATA_UNAVAILABLE")
@@ -420,6 +486,7 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
             summary["rejections"][state] = summary["rejections"].get(state, 0) + 1
     conn.commit()
     summary["counts"]["filing_documents_reviewed"] = docs_reviewed
+    summary["counts"]["filing_documents_reused"] = docs_reused
     summary["counts"]["states"] = states
     # Coverage accounting: every considered event must land in exactly one
     # state; budget exhaustion and fetch failures are visible, never folded
@@ -432,10 +499,12 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
         "ranked": len(ranked),
         "read_set_budget": content_cap,
         "documents_reviewed": docs_reviewed,
+        "documents_reused": docs_reused,
         "research_pending_budget_deferred": states.get("US_TRIAL_RESEARCH_PENDING", 0),
         "fetch_failed": states.get("US_TRIAL_FETCH_FAILED", 0),
         "genuine_missing_data": states.get("US_TRIAL_INSUFFICIENT_DATA", 0),
         "post_event_pending": states.get("US_TRIAL_POST_EVENT_PENDING", 0),
+        "partial_precision": states.get("US_TRIAL_PARTIAL_PRECISION", 0),
         "positive_moves_observed": states.get("US_TRIAL_OBSERVED_POSITIVE_MOVE", 0),
         "episode_members": states.get("US_TRIAL_EPISODE_MEMBER", 0),
         "near_misses": states.get("US_TRIAL_NEAR_MISS", 0),
@@ -446,6 +515,7 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
                              + coverage["rejected"] + coverage["genuine_missing_data"]
                              + coverage["research_pending_budget_deferred"]
                              + coverage["fetch_failed"] + coverage["post_event_pending"]
+                             + coverage["partial_precision"]
                              + coverage["positive_moves_observed"]
                              + coverage["episode_members"])
     coverage["reconciled"] = coverage["accounted"] == coverage["events_considered"]

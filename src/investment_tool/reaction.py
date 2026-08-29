@@ -94,6 +94,13 @@ def compute_event_reaction(conn: sqlite3.Connection, listing_id: str,
     out["car5"] = _ret(series[i0 - 1][1], series[i5][1])
     out["mkt_adj_car5"] = _madj(out["car5"], spy, base_d, dates[i5])
     out["car5_window_sessions"] = i5 - i0 + 1
+    # clean post-disclosure leg: the session AFTER the event session is free
+    # of pre-release trading even when the release was intra-session (H0/F13)
+    if i0 + 1 < len(series):
+        out["next_ret1"] = _ret(series[i0][1], series[i0 + 1][1])
+        out["mkt_adj_next_ret1"] = _madj(out["next_ret1"], spy, evt_d, dates[i0 + 1])
+    else:
+        out["next_ret1"] = out["mkt_adj_next_ret1"] = None
     out["post_cum"] = _ret(series[i0 - 1][1], series[-1][1])
     out["mkt_adj_post_cum"] = _madj(out["post_cum"], spy, base_d, dates[-1])
     vols = [v for _d, _p, v in series[max(0, i0 - 20):i0] if v]
