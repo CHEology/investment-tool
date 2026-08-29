@@ -172,3 +172,20 @@ Live gate (PR-7, pending): real SEC_USER_AGENT from the user; then us-map
 live sync, daily us-sync (evening ET), halts polling, weekly full-index
 reconciliation, and a 5-calendar-day soak covering >=3 filing days including
 one amendment case and a crash-recovery drill.
+
+## US opportunity trial (2026-08-28) — status: historical experimental record
+
+The first US trial run (asof 2026-08-28, events of 2026-08-26/27) is
+preserved as an EXPERIMENTAL record, not a validated result. Adjudicated
+corrections (approved review):
+- outputs are LEADS (price trigger + keyword routing), never opportunities;
+  the run's 23 admissions were relabeled US_TRIAL_LEAD and reissued as v2
+  cards (v1 frozen cards retained, SUPERSEDED);
+- budget exhaustion is US_TRIAL_RESEARCH_PENDING, never INSUFFICIENT_DATA
+  (35 rows relabeled; audit us_trial_2026-08-28_correction.json);
+- cards assert no bounded/temporary-damage conclusions; trailing asof
+  windows are labeled non-event-anchored diagnostics;
+- HQY is UNRESOLVED pending sourced evidence.
+Known engine defects (trailing windows as gates, no episode consolidation)
+are fixed by the PR-A/PR-B slices; the next real run is gated on those plus
+the PR-G soak.
