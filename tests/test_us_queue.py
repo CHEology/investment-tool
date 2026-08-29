@@ -4,7 +4,6 @@ The falsifiable core: with a budget of 1 and two triggered events where the
 FIRST-SEEN one is the WEAKER signal, the stronger event must win the read
 slot (first-seen order deciding the budget was the F2 defect)."""
 
-import datetime
 import json
 
 import pytest
@@ -17,7 +16,7 @@ from investment_tool import ranking, us_queue
 
 @pytest.fixture
 def tcfg():
-    return config_mod.load("us_trial_v0.1")
+    return config_mod.load("us_trial_v0.2")
 
 
 def _mk_company(conn, cid, ticker, lid):
@@ -27,34 +26,36 @@ def _mk_company(conn, cid, ticker, lid):
                  " currency) VALUES(?,?,?,'NASDAQ','USD')", (lid, cid, ticker))
 
 
+def _sessions(n=80, end="2026-08-28"):
+    from investment_tool import calendars_us
+    c = calendars_us.cal()
+    return [s.strftime("%Y-%m-%d")
+            for s in c.sessions_in_range("2026-01-02", end)][-n:]
+
+
 def _mk_series(conn, lid, days=80, crash=-0.10, vol_spike=None):
-    """Business-day series ending with a crash on the LAST session."""
-    d0 = datetime.date(2026, 5, 1)
-    px, prev, n, d = 100.0, None, 0, d0
-    while n < days:
-        if d.weekday() < 5:
-            ret = crash if n == days - 1 else 0.001
-            px *= (1 + ret)
-            vol = vol_spike if (vol_spike and n == days - 1) else 1000000
-            conn.execute(
-                "INSERT OR REPLACE INTO security_day(listing_id, trade_date, close,"
-                " adj_close, volume, ret, ret_basis, adj_method, currency, limit_state,"
-                " provider, quality, manifest_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (lid, d.isoformat(), f"{px:.4f}", f"{px:.4f}", str(vol),
-                 None if prev is None else px / prev - 1.0, "ADJ_CONSEC",
-                 "PROVIDER_ADJ", "USD", "FREE", "yfinance", "PROVISIONAL", "m"))
-            for b in ("SPY", "QQQ"):
-                conn.execute("INSERT OR REPLACE INTO benchmark_day(index_id, trade_date,"
-                             " close, provider, quality, manifest_id)"
-                             " VALUES(?,?,?, 'yfinance','PROVISIONAL','m')",
-                             (b, d.isoformat(), "500.0"))
-            prev = px
-            n += 1
-        d += datetime.timedelta(days=1)
+    """Real-session series ending with a crash on the LAST session."""
+    px, prev = 100.0, None
+    sess = _sessions(days)
+    for i, d in enumerate(sess):
+        ret = crash if i == days - 1 else 0.001
+        px *= (1 + ret)
+        vol = vol_spike if (vol_spike and i == days - 1) else 1000000
+        conn.execute(
+            "INSERT OR REPLACE INTO security_day(listing_id, trade_date, close,"
+            " adj_close, volume, ret, ret_basis, adj_method, currency, limit_state,"
+            " provider, quality, manifest_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (lid, d, f"{px:.4f}", f"{px:.4f}", str(vol),
+             None if prev is None else px / prev - 1.0, "ADJ_CONSEC",
+             "PROVIDER_ADJ", "USD", "FREE", "yfinance", "PROVISIONAL", "m"))
+        for b in ("SPY", "QQQ"):
+            conn.execute("INSERT OR REPLACE INTO benchmark_day(index_id, trade_date,"
+                         " close, provider, quality, manifest_id)"
+                         " VALUES(?,?,?, 'yfinance','PROVISIONAL','m')",
+                         (b, d, "500.0"))
+        prev = px
     conn.commit()
-    return [r[0] for r in conn.execute(
-        "SELECT trade_date FROM security_day WHERE listing_id=? ORDER BY trade_date",
-        (lid,))]
+    return sess
 
 
 def _mk_event(conn, event_id, cid, accession, filing_date, first_seen, accepted,

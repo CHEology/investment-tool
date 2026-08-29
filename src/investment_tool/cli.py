@@ -459,10 +459,10 @@ def cmd_trial(args) -> int:
         return 1
     conn = connect()
     cfg = _cfg(conn)
-    trial_cfg = config_mod2.load("us_trial_v0.1")
+    trial_cfg = config_mod2.load("us_trial_v0.2")
     config_mod2.register(conn, trial_cfg,
-                         changelog="US trial v0.1: registered deep-read budget,"
-                                   " rank-before-budget (PR-A); gates unchanged")
+                         changelog="US trial v0.2: event-anchored gates, dual time"
+                                   " anchors, episode consolidation (PR-B)")
     summary = us_trial.run_trial(conn, cfg, trial_cfg, args.asof)
     frozen = []
     for c in summary["leads"]:
@@ -484,10 +484,10 @@ def cmd_research_queue(args) -> int:
 
     conn = connect()
     if args.process:
-        trial_cfg = config_mod2.load("us_trial_v0.1")
+        trial_cfg = config_mod2.load("us_trial_v0.2")
         config_mod2.register(conn, trial_cfg,
-                             changelog="US trial v0.1: registered deep-read budget,"
-                                       " rank-before-budget (PR-A); gates unchanged")
+                             changelog="US trial v0.2: event-anchored gates, dual time"
+                                       " anchors, episode consolidation (PR-B)")
         audit = us_queue.process_queue(conn, trial_cfg, args.process)
         print(json_mod.dumps(audit, ensure_ascii=False, indent=2, default=str))
         return 0

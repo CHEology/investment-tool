@@ -20,7 +20,7 @@ import uuid
 from datetime import date as date_cls
 from datetime import timedelta
 
-from investment_tool import us_filing_docs, us_prices, us_route
+from investment_tool import us_filing_docs, us_prices
 from investment_tool.db import DEFAULT_DATA_DIR
 from investment_tool.lineage import utc_now
 
@@ -63,101 +63,111 @@ def select_events(conn: sqlite3.Connection, asof: str) -> list[dict]:
     return out
 
 
-def _t0_date(ev: dict, asof: str) -> tuple[str | None, str]:
+def event_anchors(ev: dict) -> dict:
+    """Both clocks for one event (calendars_us). Filing events anchor on SEC
+    acceptance time with filing_date as DATE-precision fallback; halt events
+    anchor on their published timestamp, falling back to first_seen's date."""
+    from investment_tool import calendars_us
+
     if ev["accession"]:
-        elig = us_route.eligible_session_us(ev["accepted_at_utc"], ev["filing_date"])
-        d = elig["eligible_from_date"]
-        return d, elig["precision"]
-    # halt events: first_seen date (UTC) as DATE-precision anchor
-    return (ev["first_seen_at_utc"] or "")[:10] or None, "DATE"
-
-
-def _window_ret(series: list[tuple], k: int) -> float | None:
-    if len(series) < k + 1:
-        return None
-    return series[-1][1] / series[-1 - k][1] - 1.0
-
-
-def _bench_window_ret(bench: dict[str, float], dates: list[str], k: int) -> float | None:
-    if len(dates) < k + 1:
-        return None
-    a, b = bench.get(dates[-1 - k]), bench.get(dates[-1])
-    return (b / a - 1.0) if a and b else None
-
-
-def compute_reaction(conn, listing_id: str, t0: str | None, asof: str) -> dict:
-    series = us_prices.adj_series(conn, listing_id, asof)
-    spy = us_prices.bench_series(conn, "SPY", asof)
-    qqq = us_prices.bench_series(conn, "QQQ", asof)
-    if not series:
-        return {"state": "NO_PRICES"}
-    dates = [d for d, _p, _v in series]
-    out: dict = {"state": "OK", "sessions": len(series), "last_session": dates[-1]}
-
-    def madj(raw: float | None, k: int) -> float | None:
-        if raw is None:
-            return None
-        b = _bench_window_ret(spy, dates, k)
-        return raw - b if b is not None else None
-
-    for k, name in ((1, "ret1"), (5, "ret5"), (21, "ret21"), (63, "ret63")):
-        raw = _window_ret(series, k)
-        out[name] = raw
-        out[f"mkt_adj_{name}"] = madj(raw, k)
-        qb = _bench_window_ret(qqq, dates, k)
-        out[f"qqq_adj_{name}"] = (raw - qb) if (raw is not None and qb is not None) else None
-
-    # event-anchored reaction
-    if t0 is None:
-        out["post_state"] = "NO_T0"
-        return out
-    idx = next((i for i, d in enumerate(dates) if d >= t0), None)
-    if idx is None:
-        out["post_state"] = "POST_EVENT_PENDING"  # eligibility after asof
-        return out
-    if idx == 0:
-        out["post_state"] = "NO_PRE_EVENT_BASELINE"
-        return out
-    out["t0_session"] = dates[idx]
-    out["post_ret1"] = series[idx][1] / series[idx - 1][1] - 1.0
-    out["post_cum"] = series[-1][1] / series[idx - 1][1] - 1.0
-    b0, b1 = spy.get(dates[idx - 1]), spy.get(dates[idx])
-    bl = spy.get(dates[-1])
-    out["mkt_adj_post_ret1"] = (out["post_ret1"] - (b1 / b0 - 1.0)) if (b0 and b1) else None
-    out["mkt_adj_post_cum"] = (out["post_cum"] - (bl / b0 - 1.0)) if (b0 and bl) else None
-    vols = [v for _d, _p, v in series[max(0, idx - 20):idx] if v]
-    v0 = series[idx][2]
-    if vols and v0:
-        med = sorted(vols)[len(vols) // 2]
-        out["volume_ratio"] = v0 / med if med else None
-    out["post_state"] = "OK"
-    return out
+        return calendars_us.anchors_for_event(
+            ev["accepted_at_utc"], ev["filing_date"], ev["first_seen_at_utc"])
+    published = ev.get("published_at_utc") or None
+    fallback = (ev["first_seen_at_utc"] or "")[:10] or None
+    return calendars_us.anchors_for_event(published, fallback, ev["first_seen_at_utc"])
 
 
 def evaluate_gates(rx: dict, tcfg) -> tuple[str, list[str]]:
-    """Returns (TRIGGERED|NEAR_MISS|NO_TRIGGER|INSUFFICIENT_DATA, hits)."""
+    """(TRIGGERED|POSITIVE_MOVE|NEAR_MISS|NO_TRIGGER|POST_EVENT_PENDING|
+    INSUFFICIENT_DATA, hits).
+
+    Every leg is EVENT-ANCHORED (us_trial_v0.2): the asof-trailing windows
+    that review F1 falsified are diagnostics only and can no longer trigger.
+    A positive event-session move is not discarded: it returns POSITIVE_MOVE
+    so discovery keeps it visible (future positive-surprise lane input)."""
     if rx.get("state") != "OK":
         return "INSUFFICIENT_DATA", []
     if rx.get("sessions", 0) < int(tcfg.value("data.min_price_sessions")):
         return "INSUFFICIENT_DATA", []
+    post_state = rx.get("post_state")
+    if post_state == "POST_EVENT_PENDING":
+        return "POST_EVENT_PENDING", []
+    if post_state != "OK":
+        return "INSUFFICIENT_DATA", []
     legs = {
-        "post1": (rx.get("mkt_adj_post_ret1"), float(tcfg.value("triggers.mkt_adj_ret1_max"))),
-        "cum5": (rx.get("mkt_adj_ret5"), float(tcfg.value("triggers.mkt_adj_ret5_max"))),
-        "slow21": (rx.get("mkt_adj_ret21"), float(tcfg.value("triggers.mkt_adj_ret21_max"))),
-        "slow63": (rx.get("mkt_adj_ret63"), float(tcfg.value("triggers.mkt_adj_ret63_max"))),
+        "evt1": (rx.get("mkt_adj_post_ret1"),
+                 float(tcfg.value("triggers.mkt_adj_event_ret1_max"))),
+        "car5": (rx.get("mkt_adj_car5"), float(tcfg.value("triggers.mkt_adj_car5_max"))),
     }
     hits = [name for name, (v, thr) in legs.items() if v is not None and v <= thr]
     vr = rx.get("volume_ratio")
-    p1 = rx.get("post_ret1")
-    if (vr is not None and p1 is not None
+    e1 = rx.get("mkt_adj_post_ret1")
+    if (vr is not None and e1 is not None
             and vr >= float(tcfg.value("triggers.volume_ratio_min"))
-            and p1 <= float(tcfg.value("triggers.volume_ret1_max"))):
+            and e1 <= float(tcfg.value("triggers.volume_event_ret1_max"))):
         hits.append("volume")
     if hits:
         return "TRIGGERED", hits
+    if (e1 is not None and e1 >= float(tcfg.value("triggers.positive_move_min"))):
+        return "POSITIVE_MOVE", ["evt1_pos"]
     frac = float(tcfg.value("triggers.near_miss_fraction"))
     near = [name for name, (v, thr) in legs.items() if v is not None and v <= thr * frac]
     return ("NEAR_MISS", near) if near else ("NO_TRIGGER", [])
+
+
+def group_episodes(evaluated: list[dict], window_sessions: int) -> None:
+    """Company-level episode consolidation (review F7): events for the same
+    company whose event sessions fall within `window_sessions` of the
+    episode's first member form ONE episode. The primary is the earliest
+    TRIGGERED member (else the earliest member); every other member is
+    reported as US_TRIAL_EPISODE_MEMBER referencing the primary — visible,
+    never silently dropped, and never a second lead for the same episode.
+    Mutates each item: ev['episode'] = {episode_id, primary_event_id,
+    member_count, is_primary}."""
+    import uuid as uuid_mod
+
+    from investment_tool import calendars_us
+
+    by_company: dict[str, list[dict]] = {}
+    for ev in evaluated:
+        if ev["rx"].get("t0_session") or ev.get("anchors", {}).get("event_session"):
+            by_company.setdefault(ev["company_id"], []).append(ev)
+    c = calendars_us.cal()
+    for _cid, evs in by_company.items():
+        evs.sort(key=lambda e: (e["anchors"].get("event_session") or "9999",
+                                e.get("accepted_at_utc") or "", e["event_id"]))
+        clusters: list[list[dict]] = []
+        for ev in evs:
+            sess = ev["anchors"].get("event_session")
+            if sess is None:
+                continue
+            placed = False
+            for cl in clusters:
+                first = cl[0]["anchors"]["event_session"]
+                try:
+                    dist = abs(c.sessions_distance(first, sess)) - 1
+                except ValueError:
+                    dist = 10 ** 6
+                if dist <= window_sessions:
+                    cl.append(ev)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([ev])
+        for cl in clusters:
+            if len(cl) == 0:
+                continue
+            triggered = [e for e in cl if e["gate"] == "TRIGGERED"]
+            primary = triggered[0] if triggered else cl[0]
+            eid = uuid_mod.uuid5(
+                uuid_mod.NAMESPACE_URL,
+                f"us_episode:{primary['company_id']}:{cl[0]['anchors']['event_session']}",
+            ).hex
+            for ev in cl:
+                ev["episode"] = {"episode_id": eid,
+                                 "primary_event_id": primary["event_id"],
+                                 "member_count": len(cl),
+                                 "is_primary": ev is primary}
 
 
 REJECT_RATIONALE = {
@@ -192,6 +202,12 @@ def assess_and_state(ev: dict, rx: dict, gate: str, hits: list[str], content: di
                "content_state": content_state, "config_version": tcfg.id}
     if gate == "INSUFFICIENT_DATA":
         return "US_TRIAL_INSUFFICIENT_DATA", profile
+    if gate == "POST_EVENT_PENDING":
+        return "US_TRIAL_POST_EVENT_PENDING", profile
+    if gate == "POSITIVE_MOVE":
+        # not excluded from discovery: recorded as an observation for a future
+        # positive-surprise lane; the negative-reversal lane cannot admit it
+        return "US_TRIAL_OBSERVED_POSITIVE_MOVE", profile
     if gate == "NO_TRIGGER":
         return "US_TRIAL_REJECTED_NO_TRIGGER", profile
     if gate == "NEAR_MISS":
@@ -297,20 +313,29 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
     coverage = us_prices.ensure_prices(conn, trial_cfg, tickers_by_listing, start, end)
     summary["price_coverage"] = coverage
 
-    # Pass 1 — reactions and gates for EVERY event (no budget applied yet).
+    # Pass 1 — dual anchors, reactions and gates for EVERY event (no budget
+    # applied yet), then company-level episode consolidation.
+    from investment_tool import reaction as reaction_mod
     evaluated: list[dict] = []
     gates: dict[str, int] = {}
     for ev in events:
-        t0, _prec = _t0_date(ev, asof)
-        rx = compute_reaction(conn, ev["listing_id"], t0, asof)
+        anchors = event_anchors(ev)
+        rx = reaction_mod.compute_event_reaction(conn, ev["listing_id"], anchors, asof)
         gate, hits = evaluate_gates(rx, trial_cfg)
         gates[gate] = gates.get(gate, 0) + 1
-        evaluated.append({**ev, "rx": rx, "gate": gate, "hits": hits})
+        evaluated.append({**ev, "anchors": anchors, "rx": rx, "gate": gate,
+                          "hits": hits})
+    group_episodes(evaluated, int(trial_cfg.value("episode.window_sessions")))
 
-    # Rank ALL triggered events, then apply the deep-read budget to the
-    # best-ranked filing events (rank-before-budget, review F2). Halt events
-    # carry synthetic content and consume no budget.
-    triggered = [e for e in evaluated if e["gate"] == "TRIGGERED"]
+    # Rank ALL triggered episode-primary events, then apply the deep-read
+    # budget to the best-ranked filing events (rank-before-budget, review
+    # F2). Halt events carry synthetic content and consume no budget;
+    # non-primary episode members never take a second read for the same
+    # episode (review F7).
+    def _is_primary(e: dict) -> bool:
+        return e.get("episode", {}).get("is_primary", True)
+
+    triggered = [e for e in evaluated if e["gate"] == "TRIGGERED" and _is_primary(e)]
     ranked = ranking.rank_events(triggered)
     read_set = {id(e) for e in
                 [e for e in ranked if e["accession"] is not None][:content_cap]}
@@ -323,6 +348,27 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
     states: dict[str, int] = {}
     for ev in evaluated:
         rx, gate, hits = ev["rx"], ev["gate"], ev["hits"]
+        if gate == "TRIGGERED" and not _is_primary(ev):
+            # visible episode member, never a second lead for the episode
+            profile = {"event_id": ev["event_id"], "event_type": ev["type"],
+                       "ticker": ev["ticker"], "accession": ev["accession"],
+                       "accepted_at_utc": ev["accepted_at_utc"],
+                       "first_seen_at_utc": ev["first_seen_at_utc"],
+                       "reaction": rx, "gate": gate, "trigger_legs": hits,
+                       "episode": ev.get("episode"),
+                       "config_version": trial_cfg.id}
+            state = "US_TRIAL_EPISODE_MEMBER"
+            states[state] = states.get(state, 0) + 1
+            cid = _upsert_candidate(conn, ev["company_id"], state, profile,
+                                    trial_cfg.id)
+            us_queue.enqueue(
+                conn, event_id=ev["event_id"], candidate_id=cid,
+                company_id=ev["company_id"], listing_id=ev["listing_id"],
+                ticker=ev["ticker"], asof=asof, state="SUPERSEDED",
+                rank=None, config_version=trial_cfg.id,
+                last_error=f"episode member of {ev['episode']['primary_event_id']}")
+            summary["rejections"][state] = summary["rejections"].get(state, 0) + 1
+            continue
         content = None
         content_state = None
         if gate == "TRIGGERED":
@@ -346,6 +392,8 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
                                           content_state=content_state)
         if gate == "TRIGGERED":
             profile["rank"] = ev.get("rank")
+        if ev.get("episode"):
+            profile["episode"] = ev["episode"]
         states[state] = states.get(state, 0) + 1
         cid = _upsert_candidate(conn, ev["company_id"], state, profile, trial_cfg.id)
         if gate == "TRIGGERED":
@@ -387,6 +435,9 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
         "research_pending_budget_deferred": states.get("US_TRIAL_RESEARCH_PENDING", 0),
         "fetch_failed": states.get("US_TRIAL_FETCH_FAILED", 0),
         "genuine_missing_data": states.get("US_TRIAL_INSUFFICIENT_DATA", 0),
+        "post_event_pending": states.get("US_TRIAL_POST_EVENT_PENDING", 0),
+        "positive_moves_observed": states.get("US_TRIAL_OBSERVED_POSITIVE_MOVE", 0),
+        "episode_members": states.get("US_TRIAL_EPISODE_MEMBER", 0),
         "near_misses": states.get("US_TRIAL_NEAR_MISS", 0),
         "rejected": rejected_total,
         "leads": states.get("US_TRIAL_LEAD", 0),
@@ -394,7 +445,9 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
     coverage["accounted"] = (coverage["leads"] + coverage["near_misses"]
                              + coverage["rejected"] + coverage["genuine_missing_data"]
                              + coverage["research_pending_budget_deferred"]
-                             + coverage["fetch_failed"])
+                             + coverage["fetch_failed"] + coverage["post_event_pending"]
+                             + coverage["positive_moves_observed"]
+                             + coverage["episode_members"])
     coverage["reconciled"] = coverage["accounted"] == coverage["events_considered"]
     summary["coverage"] = coverage
     out_dir = DEFAULT_DATA_DIR / "audit"
