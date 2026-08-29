@@ -1,0 +1,77 @@
+# US Lane A TRIAL thresholds v0.3 — every entry EXPERIMENTAL. Forward-only:
+# supersedes us_trial_v0.2 for new runs; earlier versions stay frozen.
+# Changes vs v0.2 (H0 correctness package, review F13/F17):
+#   - contaminated event windows (intra-session release, or DATE-only
+#     precision) can no longer trigger on evt1/volume ALONE: those legs are
+#     recorded as *_contaminated and need a clean corroborating leg (car5,
+#     or the new next1 = the session AFTER the event session); contaminated
+#     legs without corroboration route to TRIGGERED_PARTIAL_PRECISION
+#     (review track), never the lead track;
+#   - triggers.mkt_adj_next_ret1_max defines the clean next-session
+#     corroboration leg;
+#   - data.event_lookback_days bounds which events are (re)gated per run —
+#     older events are managed by the research queue, not re-triggered.
+meta:
+  id: us_trial_v0.4
+  status: EXPERIMENTAL
+  change_rule: forward-only; new config id per change; changelog mandatory
+  note: H0.1 revision — closes the contaminated-car5 loophole. Any window
+    CONTAINING the contaminated event session (evt1, volume, car5) is marked
+    contaminated; only strictly-post-disclosure windows (next1, post_car3
+    measured from the event-session close forward) are clean corroboration.
+    Thresholds otherwise identical to v0.3.
+
+triggers:
+  mkt_adj_event_ret1_max:
+    value: -0.07
+    purpose: "event-session reaction beyond SPY (event-anchored)"
+  mkt_adj_car5_max:
+    value: -0.12
+    purpose: "event CAR[0,+5] beyond SPY — catches reactions that build on the
+      sessions AFTER the event session"
+  volume_ratio_min:
+    value: 3.0
+    purpose: event-session volume confirmation leg
+  volume_event_ret1_max:
+    value: -0.04
+    purpose: "market-adjusted event-session decline required with the volume
+      leg (v0 used the raw return)"
+  near_miss_fraction:
+    value: 0.70
+    purpose: watchlist band below full triggers
+  positive_move_min:
+    value: 0.07
+    purpose: "record strong positive event-session moves as observations
+      rather than silently discarding them"
+  mkt_adj_next_ret1_max:
+    value: -0.04
+    purpose: "clean corroboration leg for contaminated event windows: the
+      market-adjusted return of the session AFTER the event session"
+  mkt_adj_post_car3_max:
+    value: -0.06
+    purpose: "clean corroboration leg: market-adjusted 3-session return
+      measured FROM the event-session close forward (never contains the
+      contaminated session)"
+
+content:
+  reject_categories:
+    value: [non_reliance_restatement, bankruptcy_distress]
+  review_only_categories:
+    value: [delisting_compliance, late_filing]
+  candidate_eligible_categories:
+    value: [management_change, earnings_guidance, acquisition_disposition,
+            financing_dilution, auditor_change, regulatory_halt]
+
+research:
+  content_budget: {value: 40, purpose: deep-read budget per run, applied to the
+      best-ranked triggered episode-primary filing events}
+
+episode:
+  window_sessions: {value: 5, purpose: same-company events whose event sessions
+      fall within this many sessions form one episode with one primary}
+
+data:
+  min_price_sessions: {value: 30, purpose: minimum history for horizon math}
+  event_lookback_days: {value: 15, purpose: only events first seen within this
+      many calendar days of asof are (re)gated by a trial run; older events
+      live in the research queue lifecycle}

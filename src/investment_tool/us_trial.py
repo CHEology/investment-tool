@@ -122,11 +122,23 @@ def evaluate_gates(rx: dict, tcfg) -> tuple[str, list[str]]:
             and e1 <= float(tcfg.value("triggers.volume_event_ret1_max"))):
         hits.append("volume")
     if contaminated:
-        hits = [f"{h}_contaminated" if h in ("evt1", "volume") else h for h in hits]
+        # ANY window containing the contaminated event session is tainted —
+        # including car5, whose [t0-1, t0+5] span embeds the event session
+        # (H0.1 loophole fix). Clean corroboration comes only from windows
+        # measured strictly after the event close: next1 and post_car3.
+        hits = [f"{h}_contaminated" if h in ("evt1", "volume", "car5") else h
+                for h in hits]
         n1 = rx.get("mkt_adj_next_ret1")
         if (n1 is not None
                 and n1 <= float(tcfg.value("triggers.mkt_adj_next_ret1_max"))):
             hits.append("next1")
+        p3 = rx.get("mkt_adj_post_car3")
+        try:
+            p3_thr = float(tcfg.value("triggers.mkt_adj_post_car3_max"))
+        except KeyError:
+            p3_thr = None  # pre-v0.4 configs: post_car3 leg absent
+        if p3 is not None and p3_thr is not None and p3 <= p3_thr:
+            hits.append("post_car3")
         clean = [h for h in hits if not h.endswith("_contaminated")]
         if hits and not clean:
             return "TRIGGERED_PARTIAL_PRECISION", hits

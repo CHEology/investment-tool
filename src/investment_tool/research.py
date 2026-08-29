@@ -31,20 +31,31 @@ from investment_tool import us_filing_docs
 from investment_tool.db import DEFAULT_DATA_DIR
 from investment_tool.lineage import utc_now
 
-ROLES = ("search", "constructive", "adversarial", "rebuttal", "adjudicator")
+ROLES = ("search", "constructive", "adversarial", "rebuttal", "semantic_review",
+         "adjudicator")
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 MAX_LOOPS = 2
-DECISIONS = ("REJECTED", "UNRESOLVED", "RESEARCH_REQUESTED", "RESEARCH_CANDIDATE")
+# Opportunity states (H1.1/F-J): research sufficiency and opportunity ranking
+# are separate axes. QUALIFIED requires complete coverage and full semantic
+# review; CONDITIONAL/BEST_AVAILABLE surface the strongest leads with their
+# uncertainty exposed; a BLOCKED channel is a veto only when the adjudicator
+# names it indispensable.
+DECISIONS = ("REJECTED", "UNRESOLVED", "RESEARCH_REQUESTED",
+             "QUALIFIED_CANDIDATE", "CONDITIONAL_CANDIDATE",
+             "BEST_AVAILABLE_WATCH")
+FINAL_STATES = ("REJECTED", "UNRESOLVED", "QUALIFIED_CANDIDATE",
+                "CONDITIONAL_CANDIDATE", "BEST_AVAILABLE_WATCH")
 
 _ROLE_STATES = {  # states in which each role's import is accepted
     "search": ("OPENED", "EVIDENCE_SEARCH", "RESEARCH_REQUESTED"),
     "constructive": ("BUNDLE_FROZEN", "QUANT_READY"),
     "adversarial": ("UNDER_ADVERSARIAL",),
     "rebuttal": ("REBUTTAL",),
+    "semantic_review": ("SEMANTIC_REVIEW",),
     "adjudicator": ("ADJUDICATION",),
 }
 _ROLE_NEXT = {"constructive": "UNDER_ADVERSARIAL", "adversarial": "REBUTTAL",
-              "rebuttal": "ADJUDICATION"}
+              "rebuttal": "SEMANTIC_REVIEW", "semantic_review": "ADJUDICATION"}
 
 
 def case_dir(case_id: str) -> Path:
@@ -128,10 +139,12 @@ def build_bundle(conn: sqlite3.Connection, case_id: str) -> dict:
             if tp.exists():
                 filing_texts[f["accession"] + suffix] = str(tp)
     evidence = [dict(r) for r in conn.execute(
-        "SELECT evidence_id, source_url, title, publisher_domain, source_class,"
-        " published_at_utc, retrieved_at_utc, first_seen_at_utc, content_path,"
-        " contradiction_state, access_note FROM evidence WHERE case_id=?"
-        " ORDER BY first_seen_at_utc", (case_id,))]
+        "SELECT e.evidence_id, e.source_url, e.title, e.publisher_domain,"
+        " e.source_class, e.published_at_utc, e.retrieved_at_utc,"
+        " e.first_seen_at_utc, e.content_path, e.contradiction_state,"
+        " e.access_note FROM evidence e"
+        " JOIN case_evidence ce ON ce.evidence_id = e.evidence_id"
+        " WHERE ce.case_id=? ORDER BY e.first_seen_at_utc", (case_id,))]
     for e in evidence:
         pub = e.get("published_at_utc")
         e["decision_eligible"] = bool(pub) and pub <= case["decision_cutoff_utc"]
@@ -192,12 +205,38 @@ def _known_missing(quantpack: dict | None) -> list[str]:
 
 
 def freeze_bundle(conn: sqlite3.Connection, case_id: str) -> dict:
+    """Freeze an immutable bundle version. The bundle CRYPTOGRAPHICALLY
+    covers its evidence (H1.1/F-F): every referenced text is snapshotted
+    into the bundle directory and its sha256 recorded in bundle.json, so the
+    content hash of bundle.json binds the exact evidence content — mutating
+    an original file later is detectable (verify_bundle) and never silently
+    changes a frozen bundle."""
     case = conn.execute("SELECT * FROM research_case WHERE case_id=?",
                         (case_id,)).fetchone()
     bundle = build_bundle(conn, case_id)
     version = case["bundle_version"] + 1
     bdir = case_dir(case_id) / f"bundle_v{version}"
-    bdir.mkdir(parents=True, exist_ok=True)
+    (bdir / "evidence").mkdir(parents=True, exist_ok=True)
+    (bdir / "filings").mkdir(parents=True, exist_ok=True)
+    for e in bundle["evidence"]:
+        src = Path(e["content_path"]) if e.get("content_path") else None
+        if src and src.exists():
+            text = src.read_text()
+            e["text_sha256"] = hashlib.sha256(text.encode()).hexdigest()
+            snap = bdir / "evidence" / f"{e['evidence_id']}.txt"
+            snap.write_text(text)
+            e["snapshot_path"] = str(snap.relative_to(bdir))
+    snap_filings = {}
+    for key, path in (bundle.get("filing_texts") or {}).items():
+        fp = Path(path)
+        if fp.exists():
+            text = fp.read_text()
+            sha_f = hashlib.sha256(text.encode()).hexdigest()
+            snap = bdir / "filings" / f"{key}.txt"
+            snap.write_text(text)
+            snap_filings[key] = {"snapshot_path": str(snap.relative_to(bdir)),
+                                 "text_sha256": sha_f, "original_path": path}
+    bundle["filing_texts"] = snap_filings
     payload = json.dumps(bundle, ensure_ascii=False, indent=2, default=str)
     (bdir / "bundle.json").write_text(payload)
     sha = hashlib.sha256(payload.encode()).hexdigest()
@@ -221,6 +260,53 @@ def freeze_bundle(conn: sqlite3.Connection, case_id: str) -> dict:
     conn.commit()
     return {"bundle_id": bundle_id, "version": version, "sha256": sha,
             "path": str(bdir), "sources": len(bundle["evidence"])}
+
+
+def verify_bundle(conn: sqlite3.Connection, case_id: str,
+                  version: int | None = None) -> dict:
+    """Recompute every recorded hash of a frozen bundle: bundle.json against
+    evidence_bundle.content_sha256, each snapshot against its recorded
+    text_sha256, and each ORIGINAL evidence/filing file against the frozen
+    hash (mutation detection). Old bundles stay verifiable after later
+    versions are added."""
+    row = conn.execute(
+        "SELECT * FROM evidence_bundle WHERE case_id=? AND (? IS NULL OR"
+        " version=?) ORDER BY version DESC LIMIT 1",
+        (case_id, version, version)).fetchone()
+    if row is None:
+        return {"error": "no frozen bundle"}
+    bdir = Path(row["path"])
+    payload = (bdir / "bundle.json").read_text()
+    out = {"bundle_id": row["bundle_id"], "version": row["version"],
+           "bundle_json_ok":
+               hashlib.sha256(payload.encode()).hexdigest() == row["content_sha256"],
+           "snapshots_ok": True, "originals_mutated": []}
+    bundle = json.loads(payload)
+    for e in bundle.get("evidence", []):
+        want = e.get("text_sha256")
+        snap = e.get("snapshot_path")
+        if not (want and snap):
+            continue
+        got = hashlib.sha256((bdir / snap).read_text().encode()).hexdigest()
+        if got != want:
+            out["snapshots_ok"] = False
+        orig = e.get("content_path")
+        if orig and Path(orig).exists():
+            got_o = hashlib.sha256(Path(orig).read_text().encode()).hexdigest()
+            if got_o != want:
+                out["originals_mutated"].append(e["evidence_id"])
+    for key, f in (bundle.get("filing_texts") or {}).items():
+        want, snap = f.get("text_sha256"), f.get("snapshot_path")
+        if want and snap:
+            got = hashlib.sha256((bdir / snap).read_text().encode()).hexdigest()
+            if got != want:
+                out["snapshots_ok"] = False
+        orig = f.get("original_path")
+        if want and orig and Path(orig).exists():
+            if hashlib.sha256(Path(orig).read_text().encode()).hexdigest() != want:
+                out["originals_mutated"].append(key)
+    out["ok"] = out["bundle_json_ok"] and out["snapshots_ok"]
+    return out
 
 
 def export_role_view(conn: sqlite3.Connection, case_id: str, role: str) -> dict:
@@ -289,8 +375,11 @@ def _resolve_source(conn, case, source_id: str) -> dict | None:
                 or (f["filing_date"] + "T00:00:00Z" if f["filing_date"] else None),
                 "source_class": "PRIMARY_REGULATORY",
                 "contradiction_state": "UNCONTESTED"}
-    e = conn.execute("SELECT * FROM evidence WHERE evidence_id=? AND case_id=?",
-                     (source_id, case["case_id"])).fetchone()
+    e = conn.execute(
+        "SELECT e.* FROM evidence e JOIN case_evidence ce"
+        " ON ce.evidence_id = e.evidence_id"
+        " WHERE e.evidence_id=? AND ce.case_id=?",
+        (source_id, case["case_id"])).fetchone()
     if e is None or not e["content_path"] or not Path(e["content_path"]).exists():
         return None
     return {"kind": "evidence", "text": Path(e["content_path"]).read_text(),
@@ -321,23 +410,54 @@ def _num_close(a: float, b: float) -> bool:
     return abs(a - b) <= max(0.01 * abs(b), 0.002)
 
 
+def _has_comparison_marker(text: str) -> bool:
+    t = (text or "").lower()
+    # comparison-asserting markers only — generic expectation language
+    # ("预期" alone) is inference vocabulary, not a consensus comparison
+    return any(w in t for w in ("consensus", "estimate", "beat", "miss",
+                                "共识", "超预期", "低于预期", "超出预期",
+                                "分析师预期", "市场预期"))
+
+
+OK_VERIFICATIONS = ("SUPPORTED", "RECOMPUTED_OK", "JUDGMENT_LINKED",
+                    "PARTIALLY_SUPPORTED")
+
+
 def validate_claims(conn, case, claims: list[dict],
                     quantpack: dict | None) -> tuple[list[dict], list[str]]:
-    """Mechanical validation. Returns (annotated_claims, problems). A problem
-    on a MATERIAL claim rejects the whole import."""
+    """Mechanical validation with separated axes (H1.1/F-G):
+    QUOTE_PRESENT / SOURCE_TEMPORALLY_ELIGIBLE / SOURCE_CLASS / SEMANTIC.
+    Quote presence proves capture, not entailment — the semantic axis starts
+    as PENDING_REVIEW and is settled by the semantic_review role; the
+    adjudicator may only rely on material FACTUAL claims once that axis is
+    SEMANTICALLY_SUPPORTED. Deterministic rule: a claim asserting a
+    consensus/estimate comparison must quote a passage that itself carries
+    the comparison — "revenue increased 8%" cannot support "beat consensus".
+    Judgments must anchor to already-validated, non-self, decision-eligible
+    claims. A problem on a MATERIAL claim rejects the whole import."""
     problems: list[str] = []
-    ids = {c.get("id") for c in claims}
-    prior_ids = {r["claim_id"] for r in conn.execute(
-        "SELECT claim_id FROM claim WHERE case_id=?", (case["case_id"],))}
-    # stored ids are '<case>:<role>:<doc_id>' — accept the short doc id too
-    prior_short = {rid.split(":")[-1] for rid in prior_ids}
-    for c in claims:
+    prior = {}
+    for r in conn.execute(
+            "SELECT claim_id, verification, temporal_basis, claim_type"
+            " FROM claim WHERE case_id=?", (case["case_id"],)):
+        short = r["claim_id"].split(":")[-1]
+        prior[r["claim_id"]] = r
+        prior.setdefault(short, r)
+
+    judgments = [c for c in claims if c.get("type") == "JUDGMENT"]
+    others = [c for c in claims if c.get("type") != "JUDGMENT"]
+
+    for c in others:
         cid = c.get("id") or "?"
         ctype = c.get("type")
         material = bool(c.get("material"))
         text = c.get("text") or ""
-        if ctype not in ("FACTUAL", "NUMERIC", "JUDGMENT"):
+        detail: dict = {}
+        if ctype not in ("FACTUAL", "NUMERIC"):
             problems.append(f"{cid}: unknown claim type {ctype!r}")
+            continue
+        if not text:
+            problems.append(f"{cid}: empty claim text")
             continue
         if ctype == "FACTUAL":
             src = c.get("source_id")
@@ -357,15 +477,19 @@ def validate_claims(conn, case, claims: list[dict],
                     problems.append(f"{cid}: cites uncaptured source {src} —"
                                     " capture it via evidence-fetch first")
                 continue
-            if _norm(quote) not in _norm(resolved["text"]):
+            detail["quote_present"] = _norm(quote) in _norm(resolved["text"])
+            if not detail["quote_present"]:
                 c["verification"] = "UNSUPPORTED"
                 c["verification_note"] = "quote not found in stored source text"
+                c["verification_detail"] = detail
                 if material:
                     problems.append(f"{cid}: quote not present in {src}")
                 continue
             basis = _temporal_basis(resolved["published_at_utc"],
                                     case["decision_cutoff_utc"])
             c["temporal_basis"] = basis
+            detail["temporal"] = basis
+            detail["source_class"] = resolved["source_class"]
             if material and c.get("temporal_use", "DECISION") == "DECISION" \
                     and basis != "DECISION":
                 problems.append(
@@ -375,11 +499,27 @@ def validate_claims(conn, case, claims: list[dict],
                     " in-time source")
                 c["verification"] = "UNSUPPORTED"
                 c["verification_note"] = "temporal violation"
+                c["verification_detail"] = detail
                 continue
+            # deterministic comparison rule
+            if _has_comparison_marker(text) and not _has_comparison_marker(quote):
+                detail["semantic"] = "PARTIALLY_SUPPORTED"
+                c["verification"] = "PARTIALLY_SUPPORTED"
+                c["verification_note"] = ("claim asserts a consensus/estimate"
+                                          " comparison the quote does not carry")
+                if material:
+                    problems.append(
+                        f"{cid}: comparison claim needs a quote that itself"
+                        " establishes the comparison (consensus/estimate"
+                        " figure), not just the raw result")
+                c["verification_detail"] = detail
+                continue
+            detail["semantic"] = "PENDING_REVIEW"
             c["verification"] = ("CONFLICTED"
                                  if resolved["contradiction_state"] != "UNCONTESTED"
                                  else "SUPPORTED")
-        elif ctype == "NUMERIC":
+            c["verification_detail"] = detail
+        else:  # NUMERIC
             val = c.get("value")
             if val is None:
                 problems.append(f"{cid}: numeric claim without value")
@@ -428,19 +568,62 @@ def validate_claims(conn, case, claims: list[dict],
                 if material:
                     problems.append(f"{cid}: material numeric claim with neither"
                                     " quant_ref nor recompute spec")
-        else:  # JUDGMENT
-            support = c.get("support_claim_ids") or []
-            known = [s for s in support
-                     if s in ids or s in prior_ids or s in prior_short]
-            if known:
-                c["verification"] = "JUDGMENT_LINKED"
-            else:
-                c["verification"] = "JUDGMENT_UNANCHORED"
-                if material:
-                    problems.append(f"{cid}: material judgment must anchor to"
-                                    " at least one existing claim id")
-        if not text:
+
+    # numeric assertions may not hide inside judgment prose (H1.1/F-H)
+    _NUM_IN_JUDGMENT = re.compile(r"\d+(?:\.\d+)?\s*[x×倍]|\d+(?:\.\d+)?%")
+    in_doc = {c.get("id"): c for c in others}
+    for c in judgments:
+        cid = c.get("id") or "?"
+        material = bool(c.get("material"))
+        if not (c.get("text") or ""):
             problems.append(f"{cid}: empty claim text")
+            continue
+        if material and _NUM_IN_JUDGMENT.search(c.get("text") or "") \
+                and not c.get("derivation") and not c.get("quant_ref"):
+            problems.append(
+                f"{cid}: material judgment embeds a numeric assertion"
+                " (ratio/percent) — move it to a NUMERIC claim with quant_ref"
+                " or attach a derivation")
+            continue
+        support = c.get("support_claim_ids") or []
+        resolved_ok, resolved_decision = 0, 0
+        bad = []
+        for sid in support:
+            if sid == cid:
+                bad.append(f"{sid} (self-reference)")
+                continue
+            target = in_doc.get(sid) or prior.get(sid) \
+                or prior.get(f"{case['case_id']}:{sid}")
+            if target is None:
+                continue
+            ver = target.get("verification") if isinstance(target, dict) \
+                else target["verification"]
+            tb = target.get("temporal_basis") if isinstance(target, dict) \
+                else target["temporal_basis"]
+            ctype_t = target.get("type") if isinstance(target, dict) \
+                else target["claim_type"]
+            if ver not in OK_VERIFICATIONS:
+                bad.append(f"{sid} ({ver})")
+                continue
+            resolved_ok += 1
+            if tb == "DECISION" or ctype_t == "NUMERIC":
+                resolved_decision += 1
+        if bad and material:
+            problems.append(f"{cid}: judgment anchors to invalid supports:"
+                            f" {', '.join(bad)}")
+            continue
+        if resolved_ok == 0:
+            c["verification"] = "JUDGMENT_UNANCHORED"
+            if material:
+                problems.append(f"{cid}: material judgment must anchor to at"
+                                " least one VALIDATED existing claim id")
+            continue
+        if material and c.get("temporal_use", "DECISION") == "DECISION" \
+                and resolved_decision == 0:
+            problems.append(f"{cid}: decision-bearing judgment anchored only"
+                            " to HINDSIGHT claims")
+            continue
+        c["verification"] = "JUDGMENT_LINKED"
     return claims, problems
 
 
@@ -458,8 +641,11 @@ def _schema_problems(role: str, doc: dict) -> list[str]:
                          "falsification_conditions"),
         "adversarial": ("rationality_case", "counter_claims", "risk_register"),
         "rebuttal": ("responses",),
+        "semantic_review": ("rulings",),
         "adjudicator": ("decision", "confidence", "rationale_zh",
-                        "unresolved_questions"),
+                        "unresolved_questions", "decision_reasons",
+                        "opportunity_confidence", "evidence_confidence",
+                        "quant_confidence"),
     }[role]
     for k in req:
         if k not in doc:
@@ -473,6 +659,19 @@ def _schema_problems(role: str, doc: dict) -> list[str]:
                 p.append(f"coverage[{ch}] invalid status {st!r}")
     if role == "adjudicator" and doc.get("decision") not in DECISIONS:
         p.append(f"decision must be one of {DECISIONS}")
+    if role == "adjudicator":
+        for k in ("opportunity_confidence", "evidence_confidence",
+                  "quant_confidence"):
+            if doc.get(k) not in ("LOW", "MEDIUM", "HIGH", None):
+                p.append(f"{k} must be LOW|MEDIUM|HIGH")
+    if role == "semantic_review":
+        for r in doc.get("rulings") or []:
+            if r.get("ruling") not in ("SEMANTICALLY_SUPPORTED",
+                                       "PARTIALLY_SUPPORTED", "UNSUPPORTED",
+                                       "CONFLICTED"):
+                p.append(f"ruling[{r.get('claim_id')}] invalid: {r.get('ruling')}")
+            if not (r.get("explanation") and r.get("passage")):
+                p.append(f"ruling[{r.get('claim_id')}] needs explanation+passage")
     if role == "constructive" and doc.get("effect_classification") not in (
             "TEMPORARY", "BOUNDED", "STRUCTURAL", "UNKNOWN"):
         p.append("effect_classification must be TEMPORARY|BOUNDED|STRUCTURAL|UNKNOWN")
@@ -505,7 +704,7 @@ def import_role_output(conn: sqlite3.Connection, cfg, case_id: str, role: str,
 
     claim_fields = {"search": None, "constructive": "claims",
                     "adversarial": "counter_claims", "rebuttal": None,
-                    "adjudicator": None}[role]
+                    "semantic_review": None, "adjudicator": None}[role]
     claims = list(doc.get(claim_fields) or []) if claim_fields else []
     if role == "rebuttal":
         for r in doc.get("responses", []):
@@ -519,6 +718,12 @@ def import_role_output(conn: sqlite3.Connection, cfg, case_id: str, role: str,
     if claims:
         claims, claim_problems = validate_claims(conn, case, claims, quantpack)
         problems.extend(claim_problems)
+
+    if role == "semantic_review":
+        problems.extend(_apply_semantic_rulings(conn, case, doc,
+                                                dry_run=True))
+    if role == "adjudicator":
+        problems.extend(_validate_decision_reasons(conn, case, doc, quantpack))
 
     bundle_sha = conn.execute(
         "SELECT content_sha256 FROM evidence_bundle WHERE case_id=?"
@@ -551,14 +756,19 @@ def import_role_output(conn: sqlite3.Connection, cfg, case_id: str, role: str,
         conn.execute(
             "INSERT OR REPLACE INTO claim(claim_id, case_id, bundle_version, role,"
             " claim_type, material, text, source_id, locator, quote, quant_ref,"
-            " temporal_basis, verification, verification_note)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " temporal_basis, verification, verification_note,"
+            " verification_detail)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (f"{case_id}:{role}:{c.get('id')}", case_id, case["bundle_version"],
              role, c.get("type"), 1 if c.get("material") else 0, c.get("text"),
              c.get("source_id"), c.get("locator"), c.get("quote"),
              c.get("quant_ref"), c.get("temporal_basis"),
-             c.get("verification", "SUPPORTED"), c.get("verification_note")))
+             c.get("verification", "SUPPORTED"), c.get("verification_note"),
+             json.dumps(c.get("verification_detail"), ensure_ascii=False)
+             if c.get("verification_detail") else None))
     (case_dir(case_id) / f"{role}_output_latest.json").write_bytes(raw)
+    if role == "semantic_review":
+        _apply_semantic_rulings(conn, case, doc, dry_run=False)
     if role == "search":
         (case_dir(case_id) / "search_report_latest.json").write_bytes(raw)
         _set_state(conn, case_id, "EVIDENCE_SEARCH")
@@ -630,16 +840,65 @@ def freeze_dossier(conn: sqlite3.Connection, case_id: str) -> dict:
         "## 对抗性挑战",
         challenge.get("rationality_case", "（无）"),
         "",
-        "## 关键声明与来源",
+        "## 裁决理由（结构化，全部经校验）",
     ]
+    for r in adj.get("decision_reasons") or []:
+        w = r.get("weight", "-")
+        lines.append(f"- [{r.get('reason_type')}/{w}] {r.get('conclusion')}"
+                     + (f"（不确定性：{r['uncertainty']}）"
+                        if r.get("uncertainty") else ""))
+    lines += ["", "## 关键声明与来源"]
+    src_index: dict[str, int] = {}
+    src_lines: list[str] = []
+
+    def _src_ref(c) -> str:
+        sid = c["source_id"] or c["quant_ref"] or ""
+        if not c["source_id"]:
+            return f"QuantPack:{c['quant_ref']}" if c["quant_ref"] else ""
+        if sid not in src_index:
+            src_index[sid] = len(src_index) + 1
+            if sid.startswith("filing:"):
+                acc = sid.split(":", 1)[1].replace("_full", "")
+                f = conn.execute("SELECT primary_doc_url, form, filing_date"
+                                 " FROM sec_filing WHERE accession=?",
+                                 (acc,)).fetchone()
+                url = (f["primary_doc_url"] if f and f["primary_doc_url"] else
+                       f"https://www.sec.gov/Archives/edgar/data/-/{acc}")
+                src_lines.append(
+                    f"[{src_index[sid]}] SEC {f['form'] if f else 'filing'}"
+                    f" {acc}（{f['filing_date'] if f else '?'}）"
+                    f" · PRIMARY_REGULATORY · {url}")
+            else:
+                e = conn.execute("SELECT * FROM evidence WHERE evidence_id=?",
+                                 (sid,)).fetchone()
+                if e:
+                    src_lines.append(
+                        f"[{src_index[sid]}] {e['title'] or e['source_url']}"
+                        f" · {e['publisher_domain']} · 发布 "
+                        f"{e['published_at_utc'] or '未知'} ·"
+                        f" {e['source_class']} · {e['source_url']}"
+                        f" · 内部ID {sid}")
+                else:
+                    src_lines.append(f"[{src_index[sid]}] {sid}")
+        return f"[{src_index[sid]}]"
+
     for c in claims:
         if not c["material"]:
             continue
+        detail = json.loads(c["verification_detail"] or "{}") \
+            if "verification_detail" in c.keys() else {}
         mark = {"SUPPORTED": "✓", "RECOMPUTED_OK": "✓#", "CONFLICTED": "⚠",
+                "PARTIALLY_SUPPORTED": "≈",
                 "JUDGMENT_LINKED": "→"}.get(c["verification"], "?")
-        src = c["source_id"] or c["quant_ref"] or ""
-        lines.append(f"- [{mark}] ({c['role']}/{c['claim_type']}"
-                     f"/{c['temporal_basis'] or '-'}) {c['text']}  ⟨{src}⟩")
+        sem = detail.get("semantic")
+        semtag = {"SEMANTICALLY_SUPPORTED": "S✓", "PARTIALLY_SUPPORTED": "S≈",
+                  "UNSUPPORTED": "S✗", "CONFLICTED": "S⚠"}.get(sem, "")
+        loc = f" · 定位:{c['locator']}" if c["locator"] else ""
+        lines.append(f"- [{mark}{semtag}] ({c['role']}/{c['claim_type']}"
+                     f"/{c['temporal_basis'] or '-'}) {c['text']}"
+                     f"  {_src_ref(c)}{loc}")
+    if src_lines:
+        lines += ["", "## 来源清单（直接链接）"] + [f"- {sl}" for sl in src_lines]
     lines += [
         "",
         "## 未决问题",
@@ -675,3 +934,184 @@ def freeze_dossier(conn: sqlite3.Connection, case_id: str) -> dict:
     conn.commit()
     return {"artifact_id": artifact_id, "path": str(path), "sha256": sha,
             "decision": adj.get("decision", case["state"])}
+
+
+# ------------------------------------------- semantic review + reasons (H1.1)
+
+
+def _lookup_claim(conn, case_id: str, cid: str):
+    row = conn.execute("SELECT * FROM claim WHERE case_id=? AND"
+                       " (claim_id=? OR claim_id LIKE ?)",
+                       (case_id, cid, f"{case_id}:%:{cid}")).fetchone()
+    return row
+
+
+def _apply_semantic_rulings(conn, case, doc: dict, *, dry_run: bool) -> list[str]:
+    """Settle the semantic axis for FACTUAL claims. Completeness is enforced:
+    every MATERIAL FACTUAL claim of the case must be ruled — an unruled one
+    blocks the import, so the adjudicator can never see half-reviewed
+    evidence. UNSUPPORTED/CONFLICTED rulings downgrade the claim."""
+    problems: list[str] = []
+    ruled: dict[str, dict] = {}
+    for r in doc.get("rulings") or []:
+        cid = r.get("claim_id") or ""
+        row = _lookup_claim(conn, case["case_id"], cid)
+        if row is None:
+            problems.append(f"ruling references unknown claim {cid}")
+            continue
+        if row["claim_type"] != "FACTUAL":
+            problems.append(f"ruling {cid}: semantic review applies to FACTUAL"
+                            f" claims (got {row['claim_type']})")
+            continue
+        ruled[row["claim_id"]] = r
+    unruled = [r["claim_id"] for r in conn.execute(
+        "SELECT claim_id FROM claim WHERE case_id=? AND claim_type='FACTUAL'"
+        " AND material=1", (case["case_id"],)) if r["claim_id"] not in ruled]
+    if unruled:
+        problems.append("material FACTUAL claims not ruled: "
+                        + ", ".join(sorted(unruled)[:6])
+                        + (" …" if len(unruled) > 6 else ""))
+    if problems or dry_run:
+        return problems
+    for claim_id, r in ruled.items():
+        row = _lookup_claim(conn, case["case_id"], claim_id)
+        detail = json.loads(row["verification_detail"] or "{}")
+        detail["semantic"] = r["ruling"]
+        detail["semantic_explanation"] = r.get("explanation")
+        detail["semantic_passage"] = r.get("passage")
+        new_ver = row["verification"]
+        if r["ruling"] in ("UNSUPPORTED", "CONFLICTED"):
+            new_ver = r["ruling"]
+        elif r["ruling"] == "PARTIALLY_SUPPORTED":
+            new_ver = "PARTIALLY_SUPPORTED"
+        conn.execute("UPDATE claim SET verification=?, verification_detail=?"
+                     " WHERE claim_id=?",
+                     (new_ver, json.dumps(detail, ensure_ascii=False), claim_id))
+    conn.commit()
+    return []
+
+
+def _validate_decision_reasons(conn, case, doc: dict,
+                               quantpack: dict | None) -> list[str]:
+    """Every factual/numeric assertion the adjudicator relies on must be
+    traceable (H1.1/F-H): FACTUAL/JUDGMENT reasons reference validated
+    (and, for FACTUAL, semantically supported) claims; NUMERIC reasons match
+    a quant_ref or recompute through an explicit derivation — a ratio
+    asserted in prose that conflicts with the recomputation rejects the
+    import."""
+    problems: list[str] = []
+    reasons = doc.get("decision_reasons") or []
+    if not reasons:
+        problems.append("decision_reasons must not be empty")
+    for r in reasons:
+        rid = r.get("reason_id") or "?"
+        rtype = r.get("reason_type")
+        if rtype not in ("FACTUAL", "NUMERIC", "COVERAGE", "JUDGMENT"):
+            problems.append(f"reason {rid}: invalid reason_type {rtype!r}")
+            continue
+        if not r.get("conclusion"):
+            problems.append(f"reason {rid}: conclusion required")
+        if rtype in ("FACTUAL", "JUDGMENT"):
+            cids = r.get("claim_ids") or []
+            if not cids:
+                problems.append(f"reason {rid}: claim_ids required")
+            for cid in cids:
+                row = _lookup_claim(conn, case["case_id"], cid)
+                if row is None:
+                    problems.append(f"reason {rid}: unknown claim {cid}")
+                    continue
+                if row["verification"] not in OK_VERIFICATIONS:
+                    problems.append(f"reason {rid}: claim {cid} is"
+                                    f" {row['verification']}")
+                if rtype == "FACTUAL" and row["claim_type"] == "FACTUAL":
+                    detail = json.loads(row["verification_detail"] or "{}")
+                    if detail.get("semantic") not in ("SEMANTICALLY_SUPPORTED",):
+                        problems.append(
+                            f"reason {rid}: claim {cid} lacks semantic support"
+                            f" ({detail.get('semantic')})")
+        elif rtype == "NUMERIC":
+            val = r.get("value")
+            deriv = r.get("derivation")
+            if r.get("quant_ref") and quantpack is not None:
+                ref = _resolve_quant_ref(quantpack, r["quant_ref"])
+                if ref is None or val is None or not _num_close(float(val),
+                                                                float(ref)):
+                    problems.append(f"reason {rid}: value {val} does not match"
+                                    f" quantpack {r.get('quant_ref')} ({ref})")
+            elif deriv and deriv.get("op") == "abs_ratio":
+                num = deriv.get("numerator_value")
+                if deriv.get("numerator_quant_ref") and quantpack is not None:
+                    num = _resolve_quant_ref(quantpack,
+                                             deriv["numerator_quant_ref"])
+                den = deriv.get("denominator_value")
+                if deriv.get("denominator_quant_ref") and quantpack is not None:
+                    den = _resolve_quant_ref(quantpack,
+                                             deriv["denominator_quant_ref"])
+                try:
+                    computed = abs(float(num)) / abs(float(den))
+                except (TypeError, ZeroDivisionError):
+                    problems.append(f"reason {rid}: derivation inputs unresolved")
+                    continue
+                if val is None or not _num_close(float(val), computed):
+                    problems.append(
+                        f"reason {rid}: asserted ratio {val} conflicts with"
+                        f" derived {computed:.4g} (abs_ratio)")
+            else:
+                problems.append(f"reason {rid}: NUMERIC reason needs quant_ref"
+                                " or an abs_ratio derivation")
+    decision = doc.get("decision")
+    if decision == "QUALIFIED_CANDIDATE":
+        if doc.get("indispensable_missing"):
+            problems.append("QUALIFIED_CANDIDATE with indispensable_missing"
+                            " non-empty — downgrade to CONDITIONAL_CANDIDATE"
+                            " or resolve the gap")
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM claim WHERE case_id=? AND material=1"
+            " AND claim_type='FACTUAL' AND (verification_detail IS NULL OR"
+            " json_extract(verification_detail,'$.semantic')"
+            " != 'SEMANTICALLY_SUPPORTED')", (case["case_id"],)).fetchone()[0]
+        if bad:
+            problems.append(f"QUALIFIED_CANDIDATE with {bad} material factual"
+                            " claims lacking full semantic support")
+    return problems
+
+
+def rank_cases(conn: sqlite3.Connection) -> dict:
+    """Run-level opportunity output (H1.1/F-J): separate from qualification.
+    Returns the qualified list (possibly empty — say so plainly), the ranked
+    best-available list with per-axis confidences, and open work."""
+    order = {"QUALIFIED_CANDIDATE": 0, "CONDITIONAL_CANDIDATE": 1,
+             "BEST_AVAILABLE_WATCH": 2, "UNRESOLVED": 3,
+             "RESEARCH_REQUESTED": 4, "REJECTED": 9}
+    conf_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, None: 3}
+    rows = []
+    for rc in conn.execute("SELECT * FROM research_case").fetchall():
+        adj = _latest_output(rc["case_id"], "adjudicator") or {}
+        qp_path = case_dir(rc["case_id"]) / "quantpack_latest.json"
+        qp = json.loads(qp_path.read_text()) if qp_path.exists() else {}
+        rows.append({
+            "case_id": rc["case_id"], "ticker": rc["ticker"],
+            "state": rc["state"],
+            "decision": adj.get("decision", rc["state"]),
+            "opportunity_confidence": adj.get("opportunity_confidence"),
+            "evidence_confidence": adj.get("evidence_confidence"),
+            "quant_confidence": adj.get("quant_confidence"),
+            "unresolved": adj.get("unresolved_questions"),
+            "entry_gap": (qp.get("entry_analysis") or {}).get(
+                "remaining_gap_at_entry"),
+            "price_asof": qp.get("asof"),
+            "reasons_top": [r.get("conclusion") for r in
+                            (adj.get("decision_reasons") or [])[:3]],
+        })
+    rows.sort(key=lambda r: (order.get(r["state"], 8),
+                             conf_rank.get(r["opportunity_confidence"], 3)))
+    return {"generated_at": utc_now(),
+            "qualified": [r for r in rows if r["state"] == "QUALIFIED_CANDIDATE"],
+            "qualified_exists": any(r["state"] == "QUALIFIED_CANDIDATE"
+                                    for r in rows),
+            "best_available": [r for r in rows if r["state"] in
+                               ("CONDITIONAL_CANDIDATE", "BEST_AVAILABLE_WATCH")],
+            "unresolved": [r for r in rows if r["state"] in
+                           ("UNRESOLVED", "RESEARCH_REQUESTED")],
+            "rejected": [r for r in rows if r["state"] == "REJECTED"],
+            "all": rows}

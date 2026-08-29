@@ -133,6 +133,28 @@ def test_bundle_freeze_is_versioned_and_immutable(conn, cfg):
 # ------------------------------------------------------------ validators
 
 
+def _sem_ok(conn, case_id):
+    """Rule every material factual claim SEMANTICALLY_SUPPORTED (test helper)."""
+    rows = conn.execute("SELECT claim_id, quote FROM claim WHERE case_id=?"
+                        " AND claim_type='FACTUAL' AND material=1",
+                        (case_id,)).fetchall()
+    return {"role": "semantic_review", "rulings": [
+        {"claim_id": r["claim_id"], "ruling": "SEMANTICALLY_SUPPORTED",
+         "explanation": "quote entails claim (test)",
+         "passage": r["quote"] or "-"} for r in rows]}
+
+
+def _adj(decision="UNRESOLVED", reasons=None, **kw):
+    return {"role": "adjudicator", "decision": decision,
+            "confidence": "LOW", "opportunity_confidence": "LOW",
+            "evidence_confidence": "LOW", "quant_confidence": "LOW",
+            "rationale_zh": "r", "unresolved_questions": [],
+            "required_evidence": kw.get("required_evidence", []),
+            "decision_reasons": reasons or [
+                {"reason_id": "r1", "reason_type": "COVERAGE",
+                 "weight": "LOW", "conclusion": "test"}]}
+
+
 def _import(conn, cfg, case_id, role, doc, tmp_path):
     p = tmp_path / f"{role}_out.json"
     p.write_text(json.dumps(doc, ensure_ascii=False))
@@ -297,10 +319,10 @@ def test_material_judgment_needs_anchor_and_flow_reaches_final(conn, cfg, tmp_pa
          "claims": []}]}
     assert _import(conn, cfg, case["case_id"], "rebuttal", reb,
                    tmp_path)["status"] == "IMPORTED"
-    adj = {"role": "adjudicator", "decision": "UNRESOLVED",
-           "confidence": "LOW", "rationale_zh": "证据不足",
-           "unresolved_questions": ["q1"], "required_evidence": []}
-    out = _import(conn, cfg, case["case_id"], "adjudicator", adj, tmp_path)
+    assert _import(conn, cfg, case["case_id"], "semantic_review",
+                   _sem_ok(conn, case["case_id"]),
+                   tmp_path)["status"] == "IMPORTED"
+    out = _import(conn, cfg, case["case_id"], "adjudicator", _adj(), tmp_path)
     assert out["status"] == "IMPORTED" and out["decision"] == "UNRESOLVED"
     st = conn.execute("SELECT state FROM research_case WHERE case_id=?",
                       (case["case_id"],)).fetchone()["state"]
@@ -340,10 +362,11 @@ def test_research_request_loop_is_bounded(conn, cfg, tmp_path):
         _import(conn, cfg, case["case_id"], "adversarial", adv, tmp_path)
         reb = {"role": "rebuttal", "responses": []}
         _import(conn, cfg, case["case_id"], "rebuttal", reb, tmp_path)
-        adj = {"role": "adjudicator", "decision": "RESEARCH_REQUESTED",
-               "confidence": "LOW", "rationale_zh": "还需要证据",
-               "unresolved_questions": [], "required_evidence": ["x"]}
-        out = _import(conn, cfg, case["case_id"], "adjudicator", adj, tmp_path)
+        _import(conn, cfg, case["case_id"], "semantic_review",
+                _sem_ok(conn, case["case_id"]), tmp_path)
+        out = _import(conn, cfg, case["case_id"], "adjudicator",
+                      _adj("RESEARCH_REQUESTED", required_evidence=["x"]),
+                      tmp_path)
         assert out["status"] == "IMPORTED"
     # third request exceeds MAX_LOOPS=2 -> forced UNRESOLVED
     st = conn.execute("SELECT state, loop_count FROM research_case"
