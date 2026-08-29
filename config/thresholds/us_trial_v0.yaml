@@ -1,0 +1,32 @@
+# US Lane A TRIAL thresholds — every entry EXPERIMENTAL. Entirely separate
+# from the A-share v0.x registry (untouched). Forward-only change rule applies.
+meta:
+  id: us_trial_v0
+  status: EXPERIMENTAL
+  change_rule: forward-only; new config id per change; changelog mandatory
+  note: trial gates for the first US opportunity run; chosen from the A-share
+    threshold philosophy (market-adjusted, multi-horizon, near-miss band),
+    deliberately NOT so conservative that only terminal disasters pass.
+
+triggers:
+  mkt_adj_ret1_max: {value: -0.07, purpose: sharp 1-session reaction beyond SPY}
+  mkt_adj_ret5_max: {value: -0.12, purpose: 5-session cumulative dislocation}
+  mkt_adj_ret21_max: {value: -0.20, purpose: 21-session drawdown}
+  mkt_adj_ret63_max: {value: -0.30, purpose: 63-session slow repricing}
+  volume_ratio_min: {value: 3.0, purpose: volume confirmation leg}
+  volume_ret1_max: {value: -0.04, purpose: 1-session decline required with volume leg}
+  near_miss_fraction: {value: 0.70, purpose: watchlist band below full triggers}
+
+content:
+  # categories that can NEVER admit in the trial (proportionate-to-terminal
+  # or extreme information asymmetry), mirroring the A-share fraud policy
+  reject_categories:
+    value: [non_reliance_restatement, bankruptcy_distress]
+  review_only_categories:
+    value: [delisting_compliance, late_filing]
+  candidate_eligible_categories:
+    value: [management_change, earnings_guidance, acquisition_disposition,
+            financing_dilution, auditor_change, regulatory_halt]
+
+data:
+  min_price_sessions: {value: 30, purpose: minimum history for horizon math}

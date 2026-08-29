@@ -12,6 +12,7 @@ dependencies = [
     "pandas>=2.2",
     "numpy>=1.26",
     "keyring>=25.0",
+    "yfinance>=0.2.40",
 ]
 
 [project.optional-dependencies]
