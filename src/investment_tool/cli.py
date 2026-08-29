@@ -573,6 +573,25 @@ def cmd_research(args) -> int:
             model_id=args.model_id, provider=args.provider,
             runtime=args.runtime, tokens_in=args.tokens_in,
             tokens_out=args.tokens_out, cost_usd=args.cost_usd)
+    elif args.rcmd == "quantpack":
+        from investment_tool import quantpack as quantpack_mod
+        if args.live and args.prices_years:
+            row = conn.execute(
+                "SELECT l.listing_id, l.ticker FROM research_case rc"
+                " JOIN listing l ON l.company_id=rc.company_id"
+                " AND l.exchange IN ('NASDAQ','NYSE','AMEX')"
+                " WHERE rc.case_id=? ORDER BY l.listing_id LIMIT 1",
+                (args.case,)).fetchone()
+            if row:
+                from datetime import date, timedelta
+
+                from investment_tool import us_prices
+                start = (date.today() - timedelta(days=365 * args.prices_years))
+                us_prices.ensure_prices(conn, cfg,
+                                        {row["listing_id"]: row["ticker"]},
+                                        start.isoformat(),
+                                        date.today().isoformat())
+        out = quantpack_mod.build_quantpack(conn, cfg, args.case, live=args.live)
     elif args.rcmd == "dossier":
         out = research.freeze_dossier(conn, args.case)
     elif args.rcmd == "rank":
@@ -739,6 +758,13 @@ def build_parser() -> argparse.ArgumentParser:
     r_im.add_argument("--tokens-in", dest="tokens_in", type=int, default=None)
     r_im.add_argument("--tokens-out", dest="tokens_out", type=int, default=None)
     r_im.add_argument("--cost-usd", dest="cost_usd", type=float, default=None)
+    r_qp = rsub.add_parser("quantpack", help="build + freeze the deterministic"
+                                              " QuantPack for a case")
+    r_qp.add_argument("--case", required=True)
+    r_qp.add_argument("--live", action="store_true",
+                      help="fetch SEC companyfacts (and extended prices) live")
+    r_qp.add_argument("--prices-years", dest="prices_years", type=int, default=5,
+                      help="extended price history to fetch in --live mode")
     r_d = rsub.add_parser("dossier", help="freeze the zh dossier for a final case")
     r_d.add_argument("--case", required=True)
     rsub.add_parser("rank", help="run-level opportunity output: qualified +"

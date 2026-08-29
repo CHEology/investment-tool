@@ -62,7 +62,13 @@ def classify_domain(url: str) -> str:
     return "DISCOVERY_LEAD"
 
 
-def _client():
+def _client(url: str = ""):
+    host = (urlparse(url).hostname or "").lower()
+    if host.endswith("sec.gov"):
+        # SEC fair-access policy: declared identity + the process-global
+        # rate limiter, exactly like every other SEC access in the system
+        from investment_tool.providers import sec
+        return sec.client()
     from investment_tool.providers.base import HttpClient
     return HttpClient(user_agent=_UA, min_interval_s=1.0)
 
@@ -87,7 +93,7 @@ def capture(conn: sqlite3.Connection, cfg, case_id: str, url: str, *,
     if source_class is not None and source_class not in SOURCE_CLASSES:
         return {"error": f"unknown source_class {source_class};"
                          f" one of {SOURCE_CLASSES}"}
-    http = http or _client()
+    http = http or _client(url)
     try:
         resp = http.get(url)
         status, payload = resp.status_code, resp.content

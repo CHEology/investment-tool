@@ -308,6 +308,25 @@ CREATE TABLE IF NOT EXISTS agent_run(
   note TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agentrun_case ON agent_run(case_id, role);
+CREATE TABLE IF NOT EXISTS xbrl_fact(
+  cik TEXT NOT NULL,
+  taxonomy TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  unit TEXT NOT NULL,
+  period_start TEXT NOT NULL DEFAULT '',
+  period_end TEXT NOT NULL,
+  value TEXT NOT NULL,
+  fy TEXT, fp TEXT, form TEXT,
+  accn TEXT,
+  filed_date TEXT NOT NULL,   -- point-in-time key: facts usable only when
+                              -- filed_date <= the decision/asof date
+  frame TEXT,
+  manifest_id TEXT,
+  PRIMARY KEY(cik, taxonomy, tag, unit, period_end, period_start,
+              accn, filed_date, value)
+);
+CREATE INDEX IF NOT EXISTS idx_xbrl_lookup
+  ON xbrl_fact(cik, tag, filed_date, period_end);
 CREATE TABLE IF NOT EXISTS case_evidence(
   case_id TEXT NOT NULL,
   evidence_id TEXT NOT NULL,
@@ -478,6 +497,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
         " VALUES('h1_research_foundation', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
+        " VALUES('h2_xbrl_fact', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
     )
     junction_done = conn.execute(
         "SELECT 1 FROM schema_migration WHERE migration_id='h11_case_evidence'"
