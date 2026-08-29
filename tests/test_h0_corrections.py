@@ -15,7 +15,7 @@ from test_us_trial import _anchors, _mk_series  # shared real-session helpers
 
 @pytest.fixture
 def tcfg():
-    return config_mod.load("us_trial_v0.3")
+    return config_mod.load("us_trial_v0.4")
 
 
 # ------------------------------------------------------------- F13 gating
@@ -45,7 +45,8 @@ def test_f13_contaminated_with_clean_corroboration_triggers(conn, tcfg):
         conn, "NASDAQ:TT", _anchors(sess[75], partial=True), sess[-1])
     gate, hits = us_trial.evaluate_gates(rx, tcfg)
     assert gate == "TRIGGERED"
-    assert "evt1_contaminated" in hits and "car5" in hits and "next1" in hits
+    assert "evt1_contaminated" in hits and "car5_contaminated" in hits
+    assert "next1" in hits                    # the clean corroboration
 
 
 def test_f13_date_precision_treated_as_contaminated(conn, tcfg):
@@ -197,8 +198,10 @@ def test_f15_full_soak_passes_and_errors_block(conn, tmp_path):
                 synced=[{"date": d,
                          "us_completeness": f"INDEX_RECONCILED_AS_OF({d})"}],
                 idem={"idempotent": True} if i == 2 else None)
-    (tmp_path / "audit" / "soak" / "amendment_drill_x.json").write_text("{}")
-    (tmp_path / "audit" / "soak" / "recovery_drill_x.json").write_text("{}")
+    from investment_tool.lineage import utc_now
+    fresh = json.dumps({"generated_at": utc_now(), "passed": True})
+    (tmp_path / "audit" / "soak" / "amendment_drill_x.json").write_text(fresh)
+    (tmp_path / "audit" / "soak" / "recovery_drill_x.json").write_text(fresh)
     report = us_soak.soak_report(conn)
     assert report["gates"]["all_passed"] is True
     # an unresolved error flips the gate
@@ -269,7 +272,7 @@ def test_validate_us_snapshot_gets_market_adjustment(conn, tmp_path, monkeypatch
                  " profile_json, gates_json, detected_at_utc, config_version)"
                  " VALUES(?,?,?,?,?,?,?,?)",
                  (cand_id, "US:TT", "A", "US_TRIAL_LEAD", "{}", "{}",
-                  f"{sess[70]}T23:00:00Z", "us_trial_v0.3"))
+                  f"{sess[70]}T23:00:00Z", "us_trial_v0.4"))
     conn.execute("INSERT INTO frozen_artifact(artifact_id, kind, candidate_id,"
                  " version, frozen_at_utc, content_sha256, path, config_version,"
                  " status) VALUES('a1','CARD',?,1,?,'s','p','c','VALID')",
@@ -282,3 +285,93 @@ def test_validate_us_snapshot_gets_market_adjustment(conn, tmp_path, monkeypatch
         (cand_id,)).fetchone()["metrics_json"])
     assert snap["state"] == "TRACKED"
     assert snap["ret_mkt_adj"] is not None   # SPY-adjusted, not raw-only
+
+
+# ------------------------------------------- H0.1: contaminated-car5 loophole
+
+
+def test_h01_contaminated_crash_with_flat_after_cannot_ride_car5(conn, tcfg):
+    """F-C regression: a sharp intra-session (contaminated) event-day fall
+    with FLAT post-disclosure sessions must not reach the primary track via
+    car5 — car5 contains the contaminated session."""
+    sess = _mk_series(conn, moves={75: -0.15})     # crash on event day only
+    rx = reaction_mod.compute_event_reaction(
+        conn, "NASDAQ:TT", _anchors(sess[75], partial=True), sess[-1])
+    assert rx["mkt_adj_car5"] < -0.12              # old loophole would trigger
+    assert abs(rx["mkt_adj_post_car3"]) < 0.01     # post-disclosure flat
+    gate, hits = us_trial.evaluate_gates(rx, tcfg)
+    assert gate == "TRIGGERED_PARTIAL_PRECISION"
+    assert "car5_contaminated" in hits and "next1" not in hits
+    assert not any(h in ("evt1", "car5", "volume") for h in hits)
+
+
+def test_h01_contaminated_with_genuine_continuation_triggers(conn, tcfg):
+    sess = _mk_series(conn, moves={75: -0.15, 76: -0.05, 77: -0.03})
+    rx = reaction_mod.compute_event_reaction(
+        conn, "NASDAQ:TT", _anchors(sess[75], partial=True), sess[-1])
+    gate, hits = us_trial.evaluate_gates(rx, tcfg)
+    assert gate == "TRIGGERED"
+    assert "next1" in hits and "post_car3" in hits
+    assert "evt1_contaminated" in hits
+
+
+# ----------------------------------------------- H0.1: drill validity (F-D)
+
+
+def test_h01_expired_or_failed_drills_do_not_satisfy_gate(conn, tmp_path):
+    soak = tmp_path / "audit" / "soak"
+    soak.mkdir(parents=True, exist_ok=True)
+    (soak / "amendment_drill_old.json").write_text(json.dumps(
+        {"generated_at": "2026-06-01T00:00:00Z", "passed": True}))
+    (soak / "recovery_drill_failed.json").write_text(json.dumps(
+        {"generated_at": "2026-08-29T00:00:00Z", "passed": False}))
+    report = us_soak.soak_report(conn)
+    assert report["gates"]["crash_recovery_drilled"] is False
+    assert report["gates"]["amendment_case"] is False or \
+        report["amendments_linked_natural"] >= 1
+    assert report["amendment_drills_valid"] == []
+    assert report["recovery_drills_valid"] == []
+    # a fresh passed drill satisfies it
+    (soak / "recovery_drill_fresh.json").write_text(json.dumps(
+        {"generated_at": "2026-08-29T01:00:00Z", "passed": True}))
+    report = us_soak.soak_report(conn)
+    assert report["gates"]["crash_recovery_drilled"] is True
+
+
+# ------------------------------------- H0.1: validation anchor by kind (F-E)
+
+
+def test_h01_validation_anchor_prefers_dossier_and_yields_one_row(conn):
+    from investment_tool import validate
+
+    conn.execute("INSERT INTO company(company_id, created_asof)"
+                 " VALUES('US:VV','2026-01-01T00:00:00Z')")
+    conn.execute("INSERT INTO candidate(candidate_id, company_id, lane, state,"
+                 " profile_json, gates_json, detected_at_utc, config_version)"
+                 " VALUES('cv1','US:VV','A','US_TRIAL_LEAD','{}','{}',"
+                 " '2026-08-28T23:00:00Z','c')")
+    rows = [("card_v1", "CARD", 1, "2026-08-28T23:24:00Z", "SUPERSEDED"),
+            ("card_v2", "CARD", 2, "2026-08-29T01:00:00Z", "VALID"),
+            ("bnd_v1", "BUNDLE", 1, "2026-08-29T18:00:00Z", "VALID"),
+            ("qp_v1", "QUANT_PACK", 1, "2026-08-29T17:00:00Z", "VALID"),
+            ("qp_v2", "QUANT_PACK", 2, "2026-08-29T17:30:00Z", "VALID"),
+            ("qp_v3", "QUANT_PACK", 3, "2026-08-29T19:00:00Z", "VALID"),
+            ("dos_v1", "DOSSIER", 1, "2026-08-29T20:00:00Z", "VALID")]
+    for aid, kind, ver, ts, status in rows:
+        conn.execute("INSERT INTO frozen_artifact(artifact_id, kind, candidate_id,"
+                     " version, frozen_at_utc, content_sha256, path,"
+                     " config_version, status) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (aid, kind, "cv1", ver, ts, "s", "p", "c", status))
+    conn.commit()
+    anchors = validate._ledger_candidates(conn)
+    mine = [a for a in anchors if a["candidate_id"] == "cv1"]
+    assert len(mine) == 1                      # exactly one row per candidate
+    assert mine[0]["kind"] == "DOSSIER"        # dossier outranks card
+    assert mine[0]["frozen_at_utc"] == "2026-08-29T20:00:00Z"
+    # without a dossier, the latest VALID card anchors (not QUANT_PACK v3)
+    conn.execute("DELETE FROM frozen_artifact WHERE artifact_id='dos_v1'")
+    conn.commit()
+    mine = [a for a in validate._ledger_candidates(conn)
+            if a["candidate_id"] == "cv1"]
+    assert len(mine) == 1 and mine[0]["kind"] == "CARD"
+    assert mine[0]["frozen_at_utc"] == "2026-08-29T01:00:00Z"

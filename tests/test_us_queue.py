@@ -16,7 +16,7 @@ from investment_tool import ranking, us_queue
 
 @pytest.fixture
 def tcfg():
-    return config_mod.load("us_trial_v0.3")
+    return config_mod.load("us_trial_v0.4")
 
 
 def _mk_company(conn, cid, ticker, lid):

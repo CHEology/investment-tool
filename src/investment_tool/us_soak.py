@@ -27,6 +27,7 @@ from investment_tool.lineage import utc_now
 EVENING_INDEX_READY_ET = 18  # hours
 
 SOAK_DIR_NAME = "soak"
+DRILL_VALIDITY_DAYS = 30   # a passed drill certifies its code path this long
 
 
 def _soak_dir():
@@ -190,8 +191,35 @@ def soak_report(conn: sqlite3.Connection, window_days: int = 10) -> dict:
     amendments_natural = conn.execute(
         "SELECT COUNT(*) FROM sec_filing WHERE is_amendment=1"
         " AND amend_link_state='LINKED_UNIQUE'").fetchone()[0]
-    drills = sorted(_soak_dir().glob("amendment_drill_*.json"))
-    recoveries = sorted(_soak_dir().glob("recovery_drill_*.json"))
+    # Drills are DURABLE certification evidence with explicit validity: a
+    # passed drill certifies the code path for DRILL_VALIDITY_DAYS from its
+    # own generated_at, independent of the ledger window — but an expired or
+    # failed drill never satisfies the gate (H0.1/F-D).
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    def _valid_drills(pattern: str) -> tuple[list[dict], list[dict]]:
+        valid, expired = [], []
+        for p in sorted(_soak_dir().glob(pattern)):
+            try:
+                d = json.loads(p.read_text())
+            except json.JSONDecodeError:
+                continue
+            gen = d.get("generated_at")
+            passed = bool(d.get("passed", True))
+            age_days = None
+            if gen:
+                age_days = (now - datetime.strptime(
+                    gen, "%Y-%m-%dT%H:%M:%SZ")).days
+            row = {"file": p.name, "generated_at": gen, "passed": passed,
+                   "age_days": age_days}
+            if passed and age_days is not None and age_days <= DRILL_VALIDITY_DAYS:
+                valid.append(row)
+            else:
+                expired.append(row)
+        return valid, expired
+
+    drills, drills_expired = _valid_drills("amendment_drill_*.json")
+    recoveries, recoveries_expired = _valid_drills("recovery_drill_*.json")
     report = {
         "generated_at": utc_now(),
         "window_days": window_days,
@@ -202,8 +230,11 @@ def soak_report(conn: sqlite3.Connection, window_days: int = 10) -> dict:
         "idempotency_verifications_passed": len(idem),
         "unresolved_errors": unresolved_errors,
         "amendments_linked_natural": amendments_natural,
-        "amendment_drills": [p.name for p in drills],
-        "recovery_drills": [p.name for p in recoveries],
+        "amendment_drills_valid": drills,
+        "amendment_drills_expired_or_failed": drills_expired,
+        "recovery_drills_valid": recoveries,
+        "recovery_drills_expired_or_failed": recoveries_expired,
+        "drill_validity_days": DRILL_VALIDITY_DAYS,
         "gates": {
             "min_5_ledger_calendar_days": len(ledger_days) >= 5,
             "min_3_filing_days_in_window": len(synced_ok) >= 3,

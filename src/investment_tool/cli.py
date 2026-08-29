@@ -459,7 +459,7 @@ def cmd_trial(args) -> int:
         return 1
     conn = connect()
     cfg = _cfg(conn)
-    trial_cfg = config_mod2.load("us_trial_v0.3")
+    trial_cfg = config_mod2.load("us_trial_v0.4")
     config_mod2.register(conn, trial_cfg,
                          changelog="US trial v0.3: contamination-aware gates,"
                                    " bounded event lookback (H0)")
@@ -484,7 +484,7 @@ def cmd_research_queue(args) -> int:
 
     conn = connect()
     if args.process:
-        trial_cfg = config_mod2.load("us_trial_v0.3")
+        trial_cfg = config_mod2.load("us_trial_v0.4")
         config_mod2.register(conn, trial_cfg,
                              changelog="US trial v0.3: contamination-aware gates,"
                                        " bounded event lookback (H0)")
