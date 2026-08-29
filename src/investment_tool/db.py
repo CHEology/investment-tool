@@ -220,6 +220,28 @@ CREATE TABLE IF NOT EXISTS validation_snapshot(
   metrics_json TEXT NOT NULL,
   PRIMARY KEY(candidate_id, asof)
 );
+CREATE TABLE IF NOT EXISTS research_queue(
+  queue_id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL,
+  candidate_id TEXT,
+  company_id TEXT NOT NULL,
+  listing_id TEXT NOT NULL,
+  ticker TEXT,
+  asof TEXT NOT NULL,
+  state TEXT NOT NULL,      -- RESEARCH_PENDING | RESEARCH_IN_PROGRESS |
+                            -- RESEARCH_COMPLETED | FETCH_FAILED |
+                            -- DATA_UNAVAILABLE | REJECTED | SUPERSEDED
+  rank_score REAL,
+  rank_version TEXT,
+  rank_inputs_json TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  enqueued_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL,
+  config_version TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rq_state_rank
+  ON research_queue(state, rank_score DESC);
 CREATE TABLE IF NOT EXISTS schema_migration(
   migration_id TEXT PRIMARY KEY,
   applied_at_utc TEXT NOT NULL
@@ -352,6 +374,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
         " VALUES('s2a_us_tables', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migration(migration_id, applied_at_utc)"
+        " VALUES('pr_a_research_queue', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
     )
     lifecycle_done = conn.execute(
         "SELECT 1 FROM schema_migration WHERE migration_id='s1_artifact_lifecycle'"
