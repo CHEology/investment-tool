@@ -141,13 +141,29 @@ def freeze_card(conn: sqlite3.Connection, candidate_row, content: str) -> dict:
 _PCT = lambda v: f"{v * 100:+.2f}%" if isinstance(v, (int, float)) else "n/a"  # noqa: E731
 
 _US_STATE_ZH = {
-    "US_TRIAL_CANDIDATE": "试验候选（可能过度反应）",
+    # US_TRIAL_CANDIDATE is the legacy 2026-08-28 run label; both render as
+    # "lead" — this layer has no evidence for an opportunity claim.
+    "US_TRIAL_LEAD": "试验线索（未验证；仅价格触发+关键词路由）",
+    "US_TRIAL_CANDIDATE": "试验线索（未验证；历史运行标签）",
     "US_TRIAL_NEAR_MISS": "接近触发/观察名单",
+    "US_TRIAL_RESEARCH_PENDING": "待研究（当次深读预算延后，非数据不足）",
+    "US_TRIAL_FETCH_FAILED": "文档获取失败（待重试）",
     "US_TRIAL_INSUFFICIENT_DATA": "数据不足",
 }
 
+# Routing rationale by category — computed at render time so legacy profiles
+# never resurface removed directional language (review F3).
+_US_ROUTING_ZH = {
+    "management_change": "管理层变动类：变动性质与经济影响需研究层判断",
+    "earnings_guidance": "业绩/指引类：意外方向与幅度需对照事前预期，本层未接入",
+    "acquisition_disposition": "并购/剥离类：交易条款需研究层核对",
+    "financing_dilution": "融资/摊薄类：摊薄比例需研究层定量",
+    "auditor_change": "审计师更换类：轮换与风险信号的区分需研究层判断",
+    "regulatory_halt": "监管性停牌：停牌事实已核实，根本原因未定",
+}
 
-def render_us_card_zh(conn, candidate_row) -> str:
+
+def render_us_card_zh(conn, candidate_row, correction_note: list[str] | None = None) -> str:
     p = json.loads(candidate_row["profile_json"])
     rx = p.get("reaction", {})
     company = conn.execute(
@@ -158,8 +174,9 @@ def render_us_card_zh(conn, candidate_row) -> str:
     state_zh = _US_STATE_ZH.get(candidate_row["state"],
                                 candidate_row["state"].replace("US_TRIAL_REJECTED_", "未入围："))
     content = p.get("content") or {}
+    routing = _US_ROUTING_ZH.get(content.get("primary"))
     lines = [
-        f"# 美股试验候选卡片：{company['name_en'] or company['ticker']}"
+        f"# 美股试验线索卡片：{company['name_en'] or company['ticker']}"
         f"（{company['ticker']}.{company['exchange']}）",
         "",
         f"- **状态**: {state_zh} · **市值**: 暂无法获得（XBRL基本面数据留待后续切片）",
@@ -172,35 +189,39 @@ def render_us_card_zh(conn, candidate_row) -> str:
         f"- 事件后1个交易日: {_PCT(rx.get('post_ret1'))}（市场调整后 "
         f"{_PCT(rx.get('mkt_adj_post_ret1'))}）· 事件后累计: {_PCT(rx.get('post_cum'))}"
         f"（调整后 {_PCT(rx.get('mkt_adj_post_cum'))}）",
-        f"- 截至评估日的 1/5/21/63 日收益: {_PCT(rx.get('ret1'))} / {_PCT(rx.get('ret5'))}"
+        f"- ⚠ 截至评估日的回溯窗口（非事件锚定，仅诊断，不应据此归因）："
+        f"1/5/21/63 日 {_PCT(rx.get('ret1'))} / {_PCT(rx.get('ret5'))}"
         f" / {_PCT(rx.get('ret21'))} / {_PCT(rx.get('ret63'))}",
-        f"- 市场调整后 5/21/63 日: {_PCT(rx.get('mkt_adj_ret5'))} /"
+        f"- ⚠ 市场调整后回溯 5/21/63 日: {_PCT(rx.get('mkt_adj_ret5'))} /"
         f" {_PCT(rx.get('mkt_adj_ret21'))} / {_PCT(rx.get('mkt_adj_ret63'))}"
         f" · QQQ调整后1日: {_PCT(rx.get('qqq_adj_ret1'))}",
         f"- 事件日成交量/20日中位: {rx.get('volume_ratio'):.1f}x"
         if isinstance(rx.get("volume_ratio"), (int, float)) else
         "- 事件日成交量/20日中位: n/a",
-        f"- 触发条件命中: {', '.join(p.get('trigger_legs') or []) or '无'}",
+        f"- 触发条件命中: {', '.join(p.get('trigger_legs') or []) or '无'}"
+        "（cum5/slow21/slow63 为回溯窗口腿，事件锚定引擎见 PR-B）",
         "",
-        "## 文件内容（初步判定）",
+        "## 文件内容（关键词路由，非结论）",
         f"- 主分类: **{content.get('primary', '未获取')}** · 关键词标记: "
         f"{', '.join(content.get('flags') or []) or '无'}（{content.get('content_version', '')}）",
-        "- 暂时性中断 vs 持久性恶化: "
-        + ("倾向暂时性/有界（初步）" if candidate_row["state"] == "US_TRIAL_CANDIDATE" else "未定"),
+        "- 暂时性中断 vs 持久性恶化: 未定（本层无损害定量，不作判断）",
         "",
-        "## 为何跌幅可能（或可能不）过度",
-        f"- {p.get('excess_rationale') or p.get('reject_rationale') or '见上'}",
-        "- 反对证据：若文件披露伴随基本面恶化（收入/客户/融资条款），则跌幅可能是合理的；"
+        "## 路由依据（说明为何进入研究队列，非机会结论）",
+        f"- {routing or p.get('reject_rationale') or '见上'}",
+        "- 反对证据：若披露伴随基本面恶化（收入/客户/融资条款），则市场反应可能是合理的；"
         "本试验层未接入基本面数据，无法排除。",
         "",
         "## 未决问题",
     ]
     for qline in p.get("unresolved_questions") or ["（无记录）"]:
         lines.append(f"- {qline}")
+    if correction_note:
+        lines += ["", "## v2 更正说明（v1 卡片保留为历史记录，状态 SUPERSEDED）"]
+        lines += [f"- {n}" for n in correction_note]
     lines += [
         "",
         f"*试验配置 {p.get('config_version')} · 生成 {utc_now()} ·"
         " 数据为PROVISIONAL（yfinance扫描层，终选经EODHD抽验）·"
-        " 本卡片为研究流程产物，不构成任何投资建议，无任何仓位或买卖指令。*",
+        " 本卡片为研究流程产物（线索层），不构成任何投资建议，无任何仓位或买卖指令。*",
     ]
     return "\n".join(lines)
