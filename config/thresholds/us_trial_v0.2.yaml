@@ -1,0 +1,62 @@
+# US Lane A TRIAL thresholds v0.2 — every entry EXPERIMENTAL. Forward-only:
+# supersedes us_trial_v0.1 for new runs; v0/v0.1 stay frozen for their runs.
+# Changes vs v0.1 (PR-B, event-anchored engine):
+#   - ALL trigger legs are event-anchored: evt1 (event-session mkt-adj
+#     return), car5 (event CAR[0,+5] mkt-adj), volume (volume ratio + the
+#     MARKET-ADJUSTED event-session return — v0 used the raw return);
+#   - the trailing asof windows (old cum5/slow21/slow63 legs) can no longer
+#     trigger anything; they remain diagnostics named asof_trail_*;
+#   - positive_move_min records strong positive event-session moves as
+#     observations (US_TRIAL_OBSERVED_POSITIVE_MOVE) instead of discarding
+#     them — input for a future positive-surprise lane, NOT an admission;
+#   - episode.window_sessions consolidates same-company events into one
+#     episode (one primary, members visible as US_TRIAL_EPISODE_MEMBER).
+meta:
+  id: us_trial_v0.2
+  status: EXPERIMENTAL
+  change_rule: forward-only; new config id per change; changelog mandatory
+  note: PR-B event-anchored gates with dual time anchors (causal event
+    session vs first actionable system session, XNYS calendar).
+
+triggers:
+  mkt_adj_event_ret1_max:
+    value: -0.07
+    purpose: "event-session reaction beyond SPY (event-anchored)"
+  mkt_adj_car5_max:
+    value: -0.12
+    purpose: "event CAR[0,+5] beyond SPY — catches reactions that build on the
+      sessions AFTER the event session"
+  volume_ratio_min:
+    value: 3.0
+    purpose: event-session volume confirmation leg
+  volume_event_ret1_max:
+    value: -0.04
+    purpose: "market-adjusted event-session decline required with the volume
+      leg (v0 used the raw return)"
+  near_miss_fraction:
+    value: 0.70
+    purpose: watchlist band below full triggers
+  positive_move_min:
+    value: 0.07
+    purpose: "record strong positive event-session moves as observations
+      rather than silently discarding them"
+
+content:
+  reject_categories:
+    value: [non_reliance_restatement, bankruptcy_distress]
+  review_only_categories:
+    value: [delisting_compliance, late_filing]
+  candidate_eligible_categories:
+    value: [management_change, earnings_guidance, acquisition_disposition,
+            financing_dilution, auditor_change, regulatory_halt]
+
+research:
+  content_budget: {value: 40, purpose: deep-read budget per run, applied to the
+      best-ranked triggered episode-primary filing events}
+
+episode:
+  window_sessions: {value: 5, purpose: same-company events whose event sessions
+      fall within this many sessions form one episode with one primary}
+
+data:
+  min_price_sessions: {value: 30, purpose: minimum history for horizon math}

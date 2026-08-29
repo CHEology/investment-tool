@@ -149,6 +149,9 @@ _US_STATE_ZH = {
     "US_TRIAL_RESEARCH_PENDING": "待研究（当次深读预算延后，非数据不足）",
     "US_TRIAL_FETCH_FAILED": "文档获取失败（待重试）",
     "US_TRIAL_INSUFFICIENT_DATA": "数据不足",
+    "US_TRIAL_POST_EVENT_PENDING": "事件会话晚于评估日（待价格）",
+    "US_TRIAL_OBSERVED_POSITIVE_MOVE": "正向异动观察（非负面通道候选；供未来正意外通道）",
+    "US_TRIAL_EPISODE_MEMBER": "事件簇成员（见主事件，避免同一事件簇重复线索）",
 }
 
 # Routing rationale by category — computed at render time so legacy profiles
@@ -184,22 +187,51 @@ def render_us_card_zh(conn, candidate_row, correction_note: list[str] | None = N
         f"{p.get('accession') or '（停牌事件，无文件）'}",
         f"- **SEC受理时间**: {p.get('accepted_at_utc') or '未获得（日期精度）'}"
         f" · **系统首次观察**: {p.get('first_seen_at_utc')}",
+    ]
+    anc = rx.get("anchors") or {}
+    if anc.get("event_session"):
+        lines += [
+            "",
+            "## 双时间锚（因果时钟 vs 系统决策时钟）",
+            f"- 因果事件会话: {anc.get('event_session')}"
+            f"（{anc.get('session_relation') or anc.get('precision')}"
+            + ("，盘中披露：事件会话收益含披露前交易" if anc.get("same_session_partial")
+               else "") + "）",
+            f"- 系统首个可行动会话: {anc.get('first_actionable_session') or '未定'}"
+            f" · 检测延迟: {anc.get('detection_latency_sessions')} 个会话"
+            f"（{anc.get('detection_latency_seconds')} 秒）",
+            f"- 观察前已实现（基线→入场收盘）: "
+            f"{_PCT(rx.get('realized_before_entry'))}（市场调整后 "
+            f"{_PCT(rx.get('mkt_adj_realized_before_entry'))}）",
+            f"- 决策锚以来（入场收盘→评估日）: {_PCT(rx.get('forward_from_decision'))}"
+            f"（市场调整后 {_PCT(rx.get('mkt_adj_forward_from_decision'))}）· "
+            "前向验证自决策锚起算，绝不自事件会话起算",
+        ]
+    lines += [
         "",
         "## 多周期市场反应（经SPY调整；QQQ对照另列）",
-        f"- 事件后1个交易日: {_PCT(rx.get('post_ret1'))}（市场调整后 "
+        f"- 事件会话收益: {_PCT(rx.get('post_ret1'))}（市场调整后 "
         f"{_PCT(rx.get('mkt_adj_post_ret1'))}）· 事件后累计: {_PCT(rx.get('post_cum'))}"
-        f"（调整后 {_PCT(rx.get('mkt_adj_post_cum'))}）",
+        f"（调整后 {_PCT(rx.get('mkt_adj_post_cum'))}）"
+        + (f" · 事件CAR[0,+5]: {_PCT(rx.get('mkt_adj_car5'))}"
+           f"（窗口{rx.get('car5_window_sessions')}日）"
+           if rx.get("mkt_adj_car5") is not None else ""),
+        f"- 事件前跑输/跑赢（特征，非触发）: 5日 {_PCT(rx.get('mkt_adj_run_up_5'))}"
+        f" / 21日 {_PCT(rx.get('mkt_adj_run_up_21'))}"
+        if "mkt_adj_run_up_21" in rx else
         f"- ⚠ 截至评估日的回溯窗口（非事件锚定，仅诊断，不应据此归因）："
         f"1/5/21/63 日 {_PCT(rx.get('ret1'))} / {_PCT(rx.get('ret5'))}"
         f" / {_PCT(rx.get('ret21'))} / {_PCT(rx.get('ret63'))}",
-        f"- ⚠ 市场调整后回溯 5/21/63 日: {_PCT(rx.get('mkt_adj_ret5'))} /"
-        f" {_PCT(rx.get('mkt_adj_ret21'))} / {_PCT(rx.get('mkt_adj_ret63'))}"
-        f" · QQQ调整后1日: {_PCT(rx.get('qqq_adj_ret1'))}",
+        f"- ⚠ 回溯诊断窗口（非事件锚定）：市场调整后 5/21/63 日 "
+        f"{_PCT(rx.get('mkt_adj_asof_trail_ret5', rx.get('mkt_adj_ret5')))} /"
+        f" {_PCT(rx.get('mkt_adj_asof_trail_ret21', rx.get('mkt_adj_ret21')))} /"
+        f" {_PCT(rx.get('mkt_adj_asof_trail_ret63', rx.get('mkt_adj_ret63')))}"
+        f" · QQQ调整后事件日: "
+        f"{_PCT(rx.get('qqq_adj_post_ret1', rx.get('qqq_adj_ret1')))}",
         f"- 事件日成交量/20日中位: {rx.get('volume_ratio'):.1f}x"
         if isinstance(rx.get("volume_ratio"), (int, float)) else
         "- 事件日成交量/20日中位: n/a",
-        f"- 触发条件命中: {', '.join(p.get('trigger_legs') or []) or '无'}"
-        "（cum5/slow21/slow63 为回溯窗口腿，事件锚定引擎见 PR-B）",
+        f"- 触发条件命中: {', '.join(p.get('trigger_legs') or []) or '无'}",
         "",
         "## 文件内容（关键词路由，非结论）",
         f"- 主分类: **{content.get('primary', '未获取')}** · 关键词标记: "

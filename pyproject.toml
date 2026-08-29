@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.26",
     "keyring>=25.0",
     "yfinance>=0.2.40",
+    "exchange-calendars>=4.5",
 ]
 
 [project.optional-dependencies]
