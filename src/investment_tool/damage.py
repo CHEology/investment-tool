@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from investment_tool.numeric import dec
 
-TEMPLATES = ("market_access", "earnings_decomposition")
+TEMPLATES = ("market_access", "earnings_decomposition", "dilution")
 
 
 class DamageParamError(ValueError):
@@ -86,11 +86,36 @@ def earnings_decomposition(params: dict) -> DamageBracket:
     )
 
 
+def dilution(params: dict) -> DamageBracket:
+    """Equity issuance / convertible dilution (US H2).
+
+    low  = underpricing cost actually transferred: proceeds x discount_low
+           (0 when the raise prices fairly);
+    high = worst plausible value transfer: the new-share ownership fraction
+           applied to pre-event market cap (treats the full dilution fraction
+           as loss — conservative upper bound for a distress raise).
+    All parameters must carry sources like every other template."""
+    new = _req(params, "shares_new")
+    out = _req(params, "shares_out")
+    mcap = _req(params, "mcap_pre_event")
+    new_high = dec(str(new["high"]))
+    frac_high = new_high / (dec(str(out["value"])) + new_high)
+    high = dec(str(mcap["value"])) * frac_high
+    low = Decimal(0)
+    if "proceeds" in params and "discount" in params:
+        low = dec(str(_req(params, "proceeds")["value"])) * dec(
+            str(_req(params, "discount")["low"]))
+    return DamageBracket(low=low, high=high, template="dilution",
+                         assumptions=params)
+
+
 def run_template(name: str, params: dict) -> DamageBracket:
     if name == "market_access":
         return market_access(params)
     if name == "earnings_decomposition":
         return earnings_decomposition(params)
+    if name == "dilution":
+        return dilution(params)
     raise DamageParamError(f"DAMAGE_MODEL_UNAVAILABLE: no template '{name}'")
 
 
