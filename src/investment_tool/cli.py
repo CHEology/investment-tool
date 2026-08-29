@@ -596,6 +596,11 @@ def cmd_research(args) -> int:
         out = research.freeze_dossier(conn, args.case)
     elif args.rcmd == "rank":
         out = research.rank_cases(conn)
+    elif args.rcmd == "peers":
+        from investment_tool import peers as peers_mod
+        out = peers_mod.set_basket(
+            conn, cfg, args.case, args.tickers.split(","), etf=args.etf,
+            rationale=args.rationale, set_by=args.set_by, live=args.live)
     elif args.rcmd == "verify-bundle":
         out = research.verify_bundle(conn, args.case)
     else:  # pragma: no cover
@@ -769,6 +774,14 @@ def build_parser() -> argparse.ArgumentParser:
     r_d.add_argument("--case", required=True)
     rsub.add_parser("rank", help="run-level opportunity output: qualified +"
                                  " ranked best-available (H1.1)")
+    r_pe = rsub.add_parser("peers", help="record a judgment-built peer basket"
+                                         " (composition+rationale audited)")
+    r_pe.add_argument("--case", required=True)
+    r_pe.add_argument("--tickers", required=True, help="comma-separated")
+    r_pe.add_argument("--etf", default=None)
+    r_pe.add_argument("--rationale", required=True)
+    r_pe.add_argument("--set-by", dest="set_by", default="operator")
+    r_pe.add_argument("--live", action="store_true", help="fetch peer prices")
     r_vb = rsub.add_parser("verify-bundle", help="recompute a frozen bundle's"
                                                  " hashes; detect mutation")
     r_vb.add_argument("--case", required=True)
