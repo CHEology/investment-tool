@@ -275,10 +275,13 @@ def review_filing_content(conn: sqlite3.Connection, trial_cfg, http,
 
 
 def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
-              content_cap: int | None = None) -> dict:
+              content_cap: int | None = None, http_factory=None) -> dict:
     from investment_tool import ranking, us_queue
-    from investment_tool.providers import sec as sec_mod
 
+    if http_factory is None:
+        def http_factory():
+            from investment_tool.providers import sec as sec_mod
+            return sec_mod.client()
     if content_cap is None:
         content_cap = int(trial_cfg.value("research.content_budget"))
     summary: dict = {"asof": asof, "generated_at": utc_now(), "config": trial_cfg.id,
@@ -329,7 +332,7 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
                 content_state = CONTENT_REVIEWED
             elif id(ev) in read_set:
                 if http is None:
-                    http = sec_mod.client()
+                    http = http_factory()
                 content, content_state, err = review_filing_content(
                     conn, trial_cfg, http, ev)
                 if content_state == CONTENT_REVIEWED:

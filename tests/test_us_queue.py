@@ -147,7 +147,8 @@ def test_budget_goes_to_best_ranked_not_first_seen(conn, tcfg, tmp_path, monkeyp
     monkeypatch.setattr(ut.us_filing_docs, "fetch_primary_document",
                         _fake_fetch(tmp_path))
     last = _two_triggered_events(conn)
-    summary = ut.run_trial(conn, None, tcfg, last, content_cap=1)
+    summary = ut.run_trial(conn, None, tcfg, last, content_cap=1,
+                           http_factory=lambda: object())
     cov = summary["coverage"]
     assert cov["triggered"] == 2 and cov["ranked"] == 2
     assert cov["documents_reviewed"] == 1
@@ -199,7 +200,8 @@ def test_process_queue_resumes_and_upgrades_candidate(conn, tcfg, tmp_path, monk
     monkeypatch.setattr(ut.us_filing_docs, "fetch_primary_document",
                         _fake_fetch(tmp_path))
     last = _two_triggered_events(conn)
-    ut.run_trial(conn, None, tcfg, last, content_cap=1)   # AAW deferred
+    ut.run_trial(conn, None, tcfg, last, content_cap=1,
+                 http_factory=lambda: object())   # AAW deferred
     audit = us_queue.process_queue(conn, tcfg, limit=5,
                                    http_factory=lambda: object())
     assert [p["outcome"] for p in audit["processed"]] == ["US_TRIAL_LEAD"]
@@ -226,7 +228,8 @@ def test_process_queue_records_fetch_failure(conn, tcfg, tmp_path, monkeypatch):
     monkeypatch.setattr(ut.us_filing_docs, "fetch_primary_document",
                         lambda *a, **k: {"state": "ERROR http=503"})
     last = _two_triggered_events(conn)
-    ut.run_trial(conn, None, tcfg, last, content_cap=0)   # both deferred
+    ut.run_trial(conn, None, tcfg, last, content_cap=0,
+                 http_factory=lambda: object())   # both deferred
     audit = us_queue.process_queue(conn, tcfg, limit=1,
                                    http_factory=lambda: object())
     assert audit["processed"][0]["outcome"] == "US_TRIAL_FETCH_FAILED"
