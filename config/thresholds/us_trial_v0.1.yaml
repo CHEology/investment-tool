@@ -1,0 +1,42 @@
+# US Lane A TRIAL thresholds v0.1 — every entry EXPERIMENTAL. Forward-only:
+# supersedes us_trial_v0 for new runs; v0 stays frozen for the 2026-08-28
+# historical record. Changes vs v0 (PR-A):
+#   - research.content_budget replaces the hardcoded content_cap=40 (the
+#     deep-read budget is now a registered, auditable threshold);
+#   - the budget is applied AFTER ranking every triggered event
+#     (rank-before-budget; ranking weights are code-versioned in
+#     ranking.py under us_rank_v0).
+# Trigger legs are unchanged from v0 and remain subject to the PR-B
+# event-anchoring rework (cum5/slow21/slow63 are trailing asof windows).
+meta:
+  id: us_trial_v0.1
+  status: EXPERIMENTAL
+  change_rule: forward-only; new config id per change; changelog mandatory
+  note: PR-A revision of us_trial_v0 — deep-read budget registered and
+    applied after ranking; gates untouched pending PR-B.
+
+triggers:
+  mkt_adj_ret1_max: {value: -0.07, purpose: sharp 1-session reaction beyond SPY}
+  mkt_adj_ret5_max: {value: -0.12, purpose: 5-session cumulative dislocation}
+  mkt_adj_ret21_max: {value: -0.20, purpose: 21-session drawdown}
+  mkt_adj_ret63_max: {value: -0.30, purpose: 63-session slow repricing}
+  volume_ratio_min: {value: 3.0, purpose: volume confirmation leg}
+  volume_ret1_max: {value: -0.04, purpose: 1-session decline required with volume leg}
+  near_miss_fraction: {value: 0.70, purpose: watchlist band below full triggers}
+
+content:
+  reject_categories:
+    value: [non_reliance_restatement, bankruptcy_distress]
+  review_only_categories:
+    value: [delisting_compliance, late_filing]
+  candidate_eligible_categories:
+    value: [management_change, earnings_guidance, acquisition_disposition,
+            financing_dilution, auditor_change, regulatory_halt]
+
+research:
+  content_budget: {value: 40, purpose: deep-read budget per run, applied to the
+      best-ranked triggered filing events; items beyond it queue as
+      RESEARCH_PENDING and stay resumable}
+
+data:
+  min_price_sessions: {value: 30, purpose: minimum history for horizon math}

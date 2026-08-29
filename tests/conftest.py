@@ -9,9 +9,9 @@ def isolate_data_dirs(tmp_path, monkeypatch):
     emits audits, cards, raw payloads, params, exports, or backups is pointed
     at the test's tmp dir. Individual tests no longer need to remember to
     monkeypatch (the ones that still do are harmlessly redundant)."""
-    from investment_tool import cards, lane_a, lineage, us_cli, validate
+    from investment_tool import cards, lane_a, lineage, us_cli, us_queue, validate
 
-    for mod in (lineage, validate, us_cli, lane_a):
+    for mod in (lineage, validate, us_cli, lane_a, us_queue):
         monkeypatch.setattr(mod, "DEFAULT_DATA_DIR", tmp_path, raising=True)
     monkeypatch.setattr(cards, "CARDS_DIR", tmp_path / "cards", raising=True)
     monkeypatch.setattr(lane_a, "PARAMS_DIR", tmp_path / "params", raising=True)

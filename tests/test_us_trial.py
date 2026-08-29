@@ -9,7 +9,8 @@ from investment_tool import us_filing_docs, us_prices, us_trial
 
 @pytest.fixture
 def tcfg():
-    return config_mod.load("us_trial_v0")
+    # v0.1 = v0 gates + the registered deep-read budget (PR-A)
+    return config_mod.load("us_trial_v0.1")
 
 
 def _mk_series(conn, lid="NASDAQ:TT", days=80, crash_at=None, crash=-0.20, vol_spike=None):

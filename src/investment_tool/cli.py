@@ -459,9 +459,10 @@ def cmd_trial(args) -> int:
         return 1
     conn = connect()
     cfg = _cfg(conn)
-    trial_cfg = config_mod2.load("us_trial_v0")
+    trial_cfg = config_mod2.load("us_trial_v0.1")
     config_mod2.register(conn, trial_cfg,
-                         changelog="US trial thresholds (EXPERIMENTAL; A-share untouched)")
+                         changelog="US trial v0.1: registered deep-read budget,"
+                                   " rank-before-budget (PR-A); gates unchanged")
     summary = us_trial.run_trial(conn, cfg, trial_cfg, args.asof)
     frozen = []
     for c in summary["leads"]:
@@ -472,6 +473,29 @@ def cmd_trial(args) -> int:
     summary["frozen_cards"] = [{"artifact_id": f["artifact_id"], "sha256": f["sha256"][:12]}
                                for f in frozen]
     print(json_mod.dumps(summary, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_research_queue(args) -> int:
+    import json as json_mod
+
+    from investment_tool import config as config_mod2
+    from investment_tool import us_queue
+
+    conn = connect()
+    if args.process:
+        trial_cfg = config_mod2.load("us_trial_v0.1")
+        config_mod2.register(conn, trial_cfg,
+                             changelog="US trial v0.1: registered deep-read budget,"
+                                       " rank-before-budget (PR-A); gates unchanged")
+        audit = us_queue.process_queue(conn, trial_cfg, args.process)
+        print(json_mod.dumps(audit, ensure_ascii=False, indent=2, default=str))
+        return 0
+    rows = us_queue.pending(conn, args.limit)
+    counts = conn.execute(
+        "SELECT state, COUNT(*) AS n FROM research_queue GROUP BY state").fetchall()
+    print(json_mod.dumps({"states": {r["state"]: r["n"] for r in counts},
+                          "next_by_rank": rows}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -571,6 +595,13 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--market", choices=["us"], required=True)
     tr.add_argument("--asof", required=True, help="evaluation date YYYY-MM-DD")
     tr.set_defaults(func=cmd_trial)
+
+    rq = sub.add_parser("research-queue",
+                        help="list or resume the deferred deep-read queue (PR-A)")
+    rq.add_argument("--process", type=int, default=0,
+                    help="process the N best-ranked pending items")
+    rq.add_argument("--limit", type=int, default=50, help="rows to list")
+    rq.set_defaults(func=cmd_research_queue)
 
     st = sub.add_parser("status", help="table counts and manifest quality summary")
     st.set_defaults(func=cmd_status)

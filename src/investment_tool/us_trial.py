@@ -244,10 +244,46 @@ def _upsert_candidate(conn, company_id: str, state: str, profile: dict, cfg_id: 
     return cid
 
 
-def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
-              content_cap: int = 40) -> dict:
+def review_filing_content(conn: sqlite3.Connection, trial_cfg, http,
+                          ev: dict) -> tuple[dict | None, str, str | None]:
+    """Fetch and assess the primary document for one filing event.
+
+    Returns (content, content_state, error). Shared by run_trial and the
+    resumable research queue so deferred items get the exact same review.
+    Enriches primary_doc_name from submissions when the index alone did not
+    carry it."""
     from investment_tool.providers import sec as sec_mod
 
+    if ev.get("primary_doc_name") is None:
+        url = sec_mod.SUBMISSIONS_URL.format(cik10=str(ev["cik"]).zfill(10))
+        resp = http.get(url)
+        if resp.status_code == 200:
+            from investment_tool import us_ingest
+            us_ingest.enrich_from_submissions(conn, resp.content)
+            row = conn.execute("SELECT primary_doc_name, accepted_at_utc"
+                               " FROM sec_filing WHERE accession=?",
+                               (ev["accession"],)).fetchone()
+            ev["primary_doc_name"] = row["primary_doc_name"]
+            ev["accepted_at_utc"] = ev["accepted_at_utc"] or row["accepted_at_utc"]
+    fetched = us_filing_docs.fetch_primary_document(conn, trial_cfg, http,
+                                                   ev["accession"])
+    if fetched.get("text_path"):
+        text = open(fetched["text_path"], encoding="utf-8").read()
+        return (us_filing_docs.assess_content(text, ev["items_csv"]),
+                CONTENT_REVIEWED, None)
+    return None, CONTENT_FETCH_FAILED, str(fetched.get("state"))
+
+
+def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
+              content_cap: int | None = None, http_factory=None) -> dict:
+    from investment_tool import ranking, us_queue
+
+    if http_factory is None:
+        def http_factory():
+            from investment_tool.providers import sec as sec_mod
+            return sec_mod.client()
+    if content_cap is None:
+        content_cap = int(trial_cfg.value("research.content_budget"))
     summary: dict = {"asof": asof, "generated_at": utc_now(), "config": trial_cfg.id,
                      "counts": {}, "leads": [], "near_misses": [],
                      "rejections": {}, "degraded": []}
@@ -261,15 +297,32 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
     coverage = us_prices.ensure_prices(conn, trial_cfg, tickers_by_listing, start, end)
     summary["price_coverage"] = coverage
 
-    http = None
-    docs_reviewed = 0
-    states: dict[str, int] = {}
+    # Pass 1 — reactions and gates for EVERY event (no budget applied yet).
+    evaluated: list[dict] = []
     gates: dict[str, int] = {}
     for ev in events:
         t0, _prec = _t0_date(ev, asof)
         rx = compute_reaction(conn, ev["listing_id"], t0, asof)
         gate, hits = evaluate_gates(rx, trial_cfg)
         gates[gate] = gates.get(gate, 0) + 1
+        evaluated.append({**ev, "rx": rx, "gate": gate, "hits": hits})
+
+    # Rank ALL triggered events, then apply the deep-read budget to the
+    # best-ranked filing events (rank-before-budget, review F2). Halt events
+    # carry synthetic content and consume no budget.
+    triggered = [e for e in evaluated if e["gate"] == "TRIGGERED"]
+    ranked = ranking.rank_events(triggered)
+    read_set = {id(e) for e in
+                [e for e in ranked if e["accession"] is not None][:content_cap]}
+    summary["counts"]["ranked"] = len(ranked)
+
+    # Pass 2 — content review for the read set; queue rows for every
+    # triggered event so nothing disappears when the budget runs out.
+    http = None
+    docs_reviewed = 0
+    states: dict[str, int] = {}
+    for ev in evaluated:
+        rx, gate, hits = ev["rx"], ev["gate"], ev["hits"]
         content = None
         content_state = None
         if gate == "TRIGGERED":
@@ -277,37 +330,35 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
                 content = {"primary": "regulatory_halt", "flags": [],
                            "content_version": us_filing_docs.CONTENT_VERSION}
                 content_state = CONTENT_REVIEWED
-            elif docs_reviewed < content_cap:
+            elif id(ev) in read_set:
                 if http is None:
-                    http = sec_mod.client()
-                if ev["primary_doc_name"] is None:
-                    url = sec_mod.SUBMISSIONS_URL.format(cik10=str(ev["cik"]).zfill(10))
-                    resp = http.get(url)
-                    if resp.status_code == 200:
-                        from investment_tool import us_ingest
-                        us_ingest.enrich_from_submissions(conn, resp.content)
-                        row = conn.execute("SELECT primary_doc_name, accepted_at_utc"
-                                           " FROM sec_filing WHERE accession=?",
-                                           (ev["accession"],)).fetchone()
-                        ev["primary_doc_name"] = row["primary_doc_name"]
-                        ev["accepted_at_utc"] = ev["accepted_at_utc"] or row["accepted_at_utc"]
-                fetched = us_filing_docs.fetch_primary_document(conn, trial_cfg, http,
-                                                               ev["accession"])
-                if fetched.get("text_path"):
+                    http = http_factory()
+                content, content_state, err = review_filing_content(
+                    conn, trial_cfg, http, ev)
+                if content_state == CONTENT_REVIEWED:
                     docs_reviewed += 1
-                    text = open(fetched["text_path"], encoding="utf-8").read()
-                    content = us_filing_docs.assess_content(text, ev["items_csv"])
-                    content_state = CONTENT_REVIEWED
                 else:
                     summary["degraded"].append({"accession": ev["accession"],
-                                                "doc": fetched.get("state")})
-                    content_state = CONTENT_FETCH_FAILED
+                                                "doc": err})
             else:
                 content_state = CONTENT_BUDGET_DEFERRED
         state, profile = assess_and_state(ev, rx, gate, hits, content, trial_cfg,
                                           content_state=content_state)
+        if gate == "TRIGGERED":
+            profile["rank"] = ev.get("rank")
         states[state] = states.get(state, 0) + 1
         cid = _upsert_candidate(conn, ev["company_id"], state, profile, trial_cfg.id)
+        if gate == "TRIGGERED":
+            queue_state = {
+                CONTENT_REVIEWED: "RESEARCH_COMPLETED",
+                CONTENT_BUDGET_DEFERRED: "RESEARCH_PENDING",
+                CONTENT_FETCH_FAILED: "FETCH_FAILED",
+            }.get(content_state, "DATA_UNAVAILABLE")
+            us_queue.enqueue(
+                conn, event_id=ev["event_id"], candidate_id=cid,
+                company_id=ev["company_id"], listing_id=ev["listing_id"],
+                ticker=ev["ticker"], asof=asof, state=queue_state,
+                rank=ev.get("rank"), config_version=trial_cfg.id)
         if state == "US_TRIAL_LEAD":
             summary["leads"].append({"candidate_id": cid, "ticker": ev["ticker"],
                                      "event_type": ev["type"],
@@ -330,6 +381,8 @@ def run_trial(conn: sqlite3.Connection, registry_cfg, trial_cfg, asof: str,
         "events_considered": len(events),
         "price_eligible": len(events) - gates.get("INSUFFICIENT_DATA", 0),
         "triggered": gates.get("TRIGGERED", 0),
+        "ranked": len(ranked),
+        "read_set_budget": content_cap,
         "documents_reviewed": docs_reviewed,
         "research_pending_budget_deferred": states.get("US_TRIAL_RESEARCH_PENDING", 0),
         "fetch_failed": states.get("US_TRIAL_FETCH_FAILED", 0),
