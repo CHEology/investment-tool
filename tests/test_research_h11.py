@@ -274,6 +274,22 @@ def test_bbw_style_ratio_conflict_rejected(conn, cfg, tmp_path):
                    tmp_path)["status"] == "IMPORTED"
 
 
+def test_adjudicator_cannot_reference_claim_from_old_bundle(conn, cfg, tmp_path):
+    case = _run_to_adjudication(conn, cfg, tmp_path)
+    conn.execute(
+        "INSERT INTO claim(claim_id, case_id, bundle_version, role, claim_type,"
+        " material, text, verification) VALUES(?,?,0,'constructive','JUDGMENT',"
+        " 1,'old bundle conclusion','JUDGMENT_LINKED')",
+        (f"{case['case_id']}:constructive:old_only", case["case_id"]))
+    conn.commit()
+    doc = _adj("REJECTED", reasons=[
+        {"reason_id": "old", "reason_type": "JUDGMENT", "weight": "HIGH",
+         "conclusion": "stale conclusion", "claim_ids": ["old_only"]}])
+    out = _import(conn, cfg, case["case_id"], "adjudicator", doc, tmp_path)
+    assert out["status"] == "REJECTED_IMPORT"
+    assert any("unknown claim old_only" in p for p in out["problems"])
+
+
 # --------------------------------------------------- F-J opportunity states
 
 

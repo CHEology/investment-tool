@@ -606,8 +606,14 @@ def cmd_research(args) -> int:
     elif args.rcmd == "run":
         from investment_tool import agent_runner
         adapter_cls = agent_runner.ADAPTERS[args.adapter]
-        adapter = (adapter_cls(model_id=args.model) if args.adapter == "anthropic"
-                   else adapter_cls())
+        if args.adapter == "codex":
+            adapter = adapter_cls(
+                model_id=args.model or "gpt-5.6-sol",
+                reasoning_effort=args.reasoning_effort)
+        elif args.adapter == "anthropic":
+            adapter = adapter_cls(model_id=args.model or "claude-sonnet-5")
+        else:
+            adapter = adapter_cls()
         out = agent_runner.orchestrate(conn, cfg, args.case, adapter)
     elif args.rcmd == "orders":
         from investment_tool import agent_runner
@@ -795,9 +801,13 @@ def build_parser() -> argparse.ArgumentParser:
                                         " steps inline, role steps via the"
                                         " configured Agent adapter (resumable)")
     r_run.add_argument("--case", required=True)
-    r_run.add_argument("--adapter", choices=["manual", "anthropic"],
+    r_run.add_argument("--adapter", choices=["manual", "anthropic", "codex"],
                        default="manual")
-    r_run.add_argument("--model", default="claude-sonnet-5")
+    r_run.add_argument("--model", default=None,
+                       help="adapter model (codex default gpt-5.6-sol)")
+    r_run.add_argument("--reasoning-effort", dest="reasoning_effort",
+                       choices=["low", "medium", "high", "xhigh"],
+                       default="medium", help="Codex Agent reasoning effort")
     r_or = rsub.add_parser("orders", help="list work-queue orders")
     r_or.add_argument("--case", default=None)
     r_vb = rsub.add_parser("verify-bundle", help="recompute a frozen bundle's"

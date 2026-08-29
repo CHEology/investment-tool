@@ -57,9 +57,26 @@ older replay result.
 
 Current limitations: the free providers may throttle or change response
 shape; historical market-snapshot coverage is sparse; BSE returns are raw and
-therefore carry corporate-action risk; and search plans are C0 human-runnable,
-not autonomous web-research execution. A zero-candidate result describes the
+therefore carry corporate-action risk. A zero-candidate result describes the
 covered sample, not the entire market when history coverage is incomplete.
+
+## Agent research
+
+The signed-in Codex runtime can execute the complete resumable research loop:
+
+```bash
+invest research run --case <case-id> --adapter codex \
+  --model gpt-5.6-sol --reasoning-effort medium
+```
+
+The Search Agent can autonomously use Web Search and follow sources beyond any
+predefined list. A URL becomes citable only after the Agent captures it through
+`invest research fetch`; later analyst and adjudication roles cannot browse and
+operate only on the frozen evidence bundle. Constructive and adversarial work
+orders are frozen before either runs and execute in distinct fresh Agent
+contexts; neither role input contains the other answer, and cross-reading is
+prohibited by contract. They may use the same provider/model without losing logical
+independence; runtime, model, context provenance, and hashes remain disclosed.
 
 Secrets live in macOS Keychain or `.env` (gitignored). The public repository
 contains code, schemas, config, and synthetic fixtures only — never market

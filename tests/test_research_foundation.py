@@ -2,6 +2,7 @@
 freezing, and the mechanical claim validators. Offline throughout."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -156,11 +157,16 @@ def _adj(decision="UNRESOLVED", reasons=None, **kw):
 
 
 def _import(conn, cfg, case_id, role, doc, tmp_path):
+    if role in ("constructive", "adversarial"):
+        doc = dict(doc)
+        doc.setdefault("independent_verdict", "INSUFFICIENT")
+        doc.setdefault("verdict_confidence", "LOW")
+        doc.setdefault("verdict_reason_claim_ids", [])
     p = tmp_path / f"{role}_out.json"
     p.write_text(json.dumps(doc, ensure_ascii=False))
     return research.import_role_output(
         conn, cfg, case_id, role, str(p), model_id="test-model",
-        provider="test", runtime="pytest")
+        provider="test", runtime="pytest", allow_legacy=True)
 
 
 def _search_doc(evidence_id, quote, extra_claims=(), state="COMPLETE"):
@@ -199,6 +205,18 @@ def test_uncaptured_source_rejected_with_capture_hint(conn, cfg, tmp_path):
                   tmp_path)
     assert out["status"] == "REJECTED_IMPORT"
     assert any("evidence-fetch" in p for p in out["problems"])
+
+
+def test_search_evidence_used_must_be_captured_for_case(conn, cfg, tmp_path):
+    case = _open(conn, cfg)
+    doc = {"role": "search", "search_state": "COMPLETE", "queries": ["q"],
+           "coverage": {"news": "FOUND"},
+           "evidence_used": ["evd_not_captured"],
+           "negative_findings": [], "competing_explanations": [],
+           "new_questions": []}
+    out = _import(conn, cfg, case["case_id"], "search", doc, tmp_path)
+    assert out["status"] == "REJECTED_IMPORT"
+    assert any("uncaptured ID" in p for p in out["problems"])
 
 
 def test_temporal_cutoff_enforced_mechanically(conn, cfg, tmp_path):
@@ -372,3 +390,11 @@ def test_research_request_loop_is_bounded(conn, cfg, tmp_path):
     st = conn.execute("SELECT state, loop_count FROM research_case"
                       " WHERE case_id=?", (case["case_id"],)).fetchone()
     assert st["state"] == "UNRESOLVED" and st["loop_count"] == 2
+    dossier = research.freeze_dossier(conn, case["case_id"])
+    assert dossier["decision"] == "UNRESOLVED"
+    assert dossier["agent_decision"] == "RESEARCH_REQUESTED"
+    assert "**裁决**: UNRESOLVED" in Path(dossier["path"]).read_text()
+    ranked_case = next(r for r in research.rank_cases(conn)["unresolved"]
+                       if r["case_id"] == case["case_id"])
+    assert ranked_case["decision"] == "UNRESOLVED"
+    assert ranked_case["agent_decision"] == "RESEARCH_REQUESTED"

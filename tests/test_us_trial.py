@@ -341,6 +341,23 @@ def test_filing_document_parse_and_content():
     assert "management_change" in content["flags"]
 
 
+def test_restated_charter_is_not_misclassified_as_financial_restatement():
+    content = us_filing_docs.assess_content(
+        "The stockholders approved the Amended and Restated Certificate of "
+        "Incorporation and the company filed Articles of Amendment.",
+        "5.03,9.01")
+    assert "non_reliance_restatement" not in content["flags"]
+    assert content["primary"] == "neutral_or_unclassified"
+
+
+def test_financial_non_reliance_language_remains_a_hard_negative():
+    content = us_filing_docs.assess_content(
+        "The previously issued financial statements should no longer be relied "
+        "upon and will be restated.", "4.02,9.01")
+    assert "non_reliance_restatement" in content["flags"]
+    assert content["primary"] == "non_reliance_restatement"
+
+
 # ------------------------------------------------------- run_trial shapes
 
 

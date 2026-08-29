@@ -34,6 +34,11 @@ from investment_tool.lineage import utc_now
 ROLES = ("search", "constructive", "adversarial", "rebuttal", "semantic_review",
          "adjudicator")
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
+PROMPT_VERSIONS = {role: f"{role}_v1" for role in ROLES}
+PROMPT_VERSIONS.update({"search": "search_v2", "constructive": "constructive_v3",
+                        "adversarial": "adversarial_v3",
+                        "rebuttal": "rebuttal_v2",
+                        "adjudicator": "adjudicator_v3"})
 MAX_LOOPS = 2
 # Opportunity states (H1.1/F-J): research sufficiency and opportunity ranking
 # are separate axes. QUALIFIED requires complete coverage and full semantic
@@ -257,6 +262,9 @@ def freeze_bundle(conn: sqlite3.Connection, case_id: str) -> dict:
                  " updated_at_utc=? WHERE case_id=?",
                  (version, "QUANT_READY" if bundle["quantpack"] else
                   "BUNDLE_FROZEN", utc_now(), case_id))
+    conn.execute("UPDATE analysis_pair SET status='SUPERSEDED'"
+                 " WHERE case_id=? AND bundle_version<?",
+                 (case_id, version))
     conn.commit()
     return {"bundle_id": bundle_id, "version": version, "sha256": sha,
             "path": str(bdir), "sources": len(bundle["evidence"])}
@@ -323,17 +331,33 @@ def export_role_view(conn: sqlite3.Connection, case_id: str, role: str) -> dict:
         return {"error": "freeze a bundle before exporting analyst views"}
     rdir = case_dir(case_id) / f"role_{role}_v{version}"
     rdir.mkdir(parents=True, exist_ok=True)
-    contract = PROMPTS_DIR / f"{role}_v1.md"
+    prompt_version = PROMPT_VERSIONS[role]
+    contract = PROMPTS_DIR / f"{prompt_version}.md"
     view: dict = {"case_id": case_id, "role": role, "bundle_version": version,
                   "bundle_path": str(bdir / "bundle.json") if version else None,
                   "decision_cutoff_utc": case["decision_cutoff_utc"],
-                  "prompt_version": f"{role}_v1"}
+                  "prompt_version": prompt_version}
     if role == "rebuttal":
         view["challenge"] = _latest_output(case_id, "adversarial")
+    if role == "semantic_review":
+        view["claims"] = [dict(r) for r in conn.execute(
+            "SELECT claim_id, role, claim_type, material, text, source_id,"
+            " locator, quote, temporal_basis, verification, verification_detail"
+            " FROM claim WHERE case_id=? AND bundle_version=?"
+            " AND claim_type='FACTUAL' AND material=1 ORDER BY claim_id",
+            (case_id, version))]
     if role == "adjudicator":
         view["claims"] = [dict(r) for r in conn.execute(
-            "SELECT * FROM claim WHERE case_id=? ORDER BY role, claim_id",
-            (case_id,))]
+            "SELECT * FROM claim WHERE case_id=? AND bundle_version=?"
+            " ORDER BY role, claim_id", (case_id, version))]
+        view["analyst_verdicts"] = {}
+        for analyst_role in ("constructive", "adversarial"):
+            analyst_output = _latest_output(case_id, analyst_role) or {}
+            view["analyst_verdicts"][analyst_role] = {
+                "verdict": analyst_output.get("independent_verdict"),
+                "confidence": analyst_output.get("verdict_confidence"),
+                "reason_claim_ids": analyst_output.get("verdict_reason_claim_ids") or [],
+            }
         view["rebuttal"] = _latest_output(case_id, "rebuttal")
         view["validation_reports"] = sorted(
             str(p) for p in case_dir(case_id).glob("validation_*.json"))
@@ -453,7 +477,8 @@ def validate_claims(conn, case, claims: list[dict],
     prior = {}
     for r in conn.execute(
             "SELECT claim_id, verification, temporal_basis, claim_type"
-            " FROM claim WHERE case_id=?", (case["case_id"],)):
+            " FROM claim WHERE case_id=? AND bundle_version=?",
+            (case["case_id"], case["bundle_version"])):
         short = r["claim_id"].split(":")[-1]
         prior[r["claim_id"]] = r
         prior.setdefault(short, r)
@@ -702,6 +727,24 @@ def _schema_problems(role: str, doc: dict) -> list[str]:
     if role == "constructive" and doc.get("effect_classification") not in (
             "TEMPORARY", "BOUNDED", "STRUCTURAL", "UNKNOWN"):
         p.append("effect_classification must be TEMPORARY|BOUNDED|STRUCTURAL|UNKNOWN")
+    if role in ("constructive", "adversarial"):
+        if doc.get("independent_verdict") not in (
+                "OPPORTUNITY_SUPPORTED", "MIXED", "MARKET_RATIONAL",
+                "INSUFFICIENT"):
+            p.append("independent_verdict must be OPPORTUNITY_SUPPORTED|MIXED|"
+                     "MARKET_RATIONAL|INSUFFICIENT")
+        if doc.get("verdict_confidence") not in ("LOW", "MEDIUM", "HIGH"):
+            p.append("verdict_confidence must be LOW|MEDIUM|HIGH")
+        verdict_claim_ids = doc.get("verdict_reason_claim_ids")
+        if not isinstance(verdict_claim_ids, list):
+            p.append("verdict_reason_claim_ids must be a list")
+        elif doc.get("independent_verdict") != "INSUFFICIENT" and not verdict_claim_ids:
+            p.append("a substantive independent verdict needs verdict_reason_claim_ids")
+        own = doc.get("claims" if role == "constructive" else "counter_claims") or []
+        own_ids = {c.get("id") for c in own}
+        for cid in verdict_claim_ids or []:
+            if cid not in own_ids:
+                p.append(f"verdict reason {cid!r} is not this Agent's claim")
     return p
 
 
@@ -709,7 +752,18 @@ def import_role_output(conn: sqlite3.Connection, cfg, case_id: str, role: str,
                        json_path: str, *, model_id: str, provider: str,
                        runtime: str, tokens_in: int | None = None,
                        tokens_out: int | None = None,
-                       cost_usd: float | None = None) -> dict:
+                       cost_usd: float | None = None,
+                       order_id: str | None = None,
+                       pair_id: str | None = None,
+                       bundle_version: int | None = None,
+                       agent_instance_id: str | None = None,
+                       context_id: str | None = None,
+                       context_provenance: str | None = None,
+                       role_input_sha256: str | None = None,
+                       input_manifest_verified: bool = False,
+                       visible_roles: list[str] | None = None,
+                       output_path: str | None = None,
+                       allow_legacy: bool = False) -> dict:
     case = conn.execute("SELECT * FROM research_case WHERE case_id=?",
                         (case_id,)).fetchone()
     if case is None:
@@ -726,6 +780,68 @@ def import_role_output(conn: sqlite3.Connection, cfg, case_id: str, role: str,
     except json.JSONDecodeError as exc:
         return {"status": "REJECTED_IMPORT", "problems": [f"invalid JSON: {exc}"]}
     problems = _schema_problems(role, doc)
+    paired_roles = ("constructive", "adversarial", "rebuttal",
+                    "semantic_review", "adjudicator")
+    if role in paired_roles and not pair_id and not allow_legacy:
+        problems.append(f"{role} requires a current work-order analysis pair")
+    if bundle_version is not None and bundle_version != case["bundle_version"]:
+        problems.append("work order bundle version is stale")
+    if pair_id:
+        pair = conn.execute("SELECT * FROM analysis_pair WHERE pair_id=?",
+                            (pair_id,)).fetchone()
+        if pair is None or pair["case_id"] != case_id:
+            problems.append("analysis pair does not belong to this case")
+        elif (pair["bundle_version"] != case["bundle_version"] or
+              pair["status"] == "SUPERSEDED"):
+            problems.append("analysis pair does not match the current bundle")
+        if not order_id:
+            problems.append("paired role import requires order_id")
+        if role in ("constructive", "adversarial"):
+            if not context_id or context_provenance == "CONTEXT_UNKNOWN":
+                problems.append("blind analyst requires a real Agent context ID")
+            if not input_manifest_verified:
+                problems.append("blind analyst input manifest was not verified")
+            if visible_roles:
+                problems.append("blind analyst role input exposed another role")
+            other = conn.execute(
+                "SELECT context_id FROM agent_run WHERE pair_id=? AND role!=?"
+                " AND role IN ('constructive','adversarial')"
+                " AND status='IMPORTED' ORDER BY ended_at_utc DESC LIMIT 1",
+                (pair_id, role)).fetchone()
+            if other and other["context_id"] == context_id:
+                problems.append("blind analysts must use distinct Agent contexts")
+        if role == "adjudicator":
+            analyst_runs = conn.execute(
+                "SELECT role, context_id, input_manifest_verified FROM agent_run"
+                " WHERE pair_id=? AND role IN ('constructive','adversarial')"
+                " AND status='IMPORTED'", (pair_id,)).fetchall()
+            if pair is None or pair["status"] != "COMPLETE":
+                problems.append("adjudication requires a completed analysis pair")
+            if ({r["role"] for r in analyst_runs} !=
+                    {"constructive", "adversarial"} or
+                    len({r["context_id"] for r in analyst_runs
+                         if r["context_id"]}) != 2 or
+                    not all(r["input_manifest_verified"] for r in analyst_runs)):
+                problems.append("adjudication requires two verified blind Agent runs")
+    if role == "search":
+        evidence_used = doc.get("evidence_used") or []
+        for evidence_id in evidence_used:
+            exists = conn.execute(
+                "SELECT 1 FROM case_evidence WHERE case_id=? AND evidence_id=?",
+                (case_id, evidence_id)).fetchone()
+            if exists is None:
+                problems.append(f"evidence_used contains uncaptured ID {evidence_id}")
+        claimed_sources = {
+            c.get("source_id") for c in (
+                (doc.get("negative_findings") or []) +
+                [claim for item in (doc.get("competing_explanations") or [])
+                 for claim in (item.get("claims") or [])])
+            if c.get("source_id") and not c["source_id"].startswith("filing:")
+        }
+        missing_used = claimed_sources - set(evidence_used)
+        if missing_used:
+            problems.append("claim sources missing from evidence_used: "
+                            + ", ".join(sorted(missing_used)))
     qp_path = case_dir(case_id) / "quantpack_latest.json"
     quantpack = json.loads(qp_path.read_text()) if qp_path.exists() else None
 
@@ -760,13 +876,21 @@ def import_role_output(conn: sqlite3.Connection, cfg, case_id: str, role: str,
     conn.execute(
         "INSERT INTO agent_run(run_id, case_id, role, model_id, provider, runtime,"
         " prompt_version, input_sha256, output_sha256, tokens_in, tokens_out,"
-        " cost_usd, status, started_at_utc, ended_at_utc, note)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (run_id, case_id, role, model_id, provider, runtime, f"{role}_v1",
-         bundle_sha["content_sha256"] if bundle_sha else None,
+        " cost_usd, status, started_at_utc, ended_at_utc, note, order_id, pair_id,"
+        " bundle_version, agent_instance_id, context_id, context_provenance,"
+        " role_input_sha256, input_manifest_verified, visible_roles_json,"
+        " output_path)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (run_id, case_id, role, model_id, provider, runtime,
+         PROMPT_VERSIONS[role],
+         role_input_sha256 or (bundle_sha["content_sha256"] if bundle_sha else None),
          hashlib.sha256(raw).hexdigest(), tokens_in, tokens_out, cost_usd,
          status, utc_now(), utc_now(),
-         f"{len(problems)} problems" if problems else None))
+         f"{len(problems)} problems" if problems else None,
+         order_id, pair_id, bundle_version, agent_instance_id, context_id,
+         context_provenance, role_input_sha256,
+         1 if input_manifest_verified else 0,
+         json.dumps(visible_roles or [], ensure_ascii=False), output_path))
     report = {"status": status, "run_id": run_id, "role": role,
               "problems": problems,
               "claims_validated": len(claims),
@@ -778,21 +902,30 @@ def import_role_output(conn: sqlite3.Connection, cfg, case_id: str, role: str,
         conn.commit()
         return report
 
+    runs_dir = case_dir(case_id) / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    immutable_output = runs_dir / f"{run_id}_{role}.json"
+    immutable_output.write_bytes(raw)
+    conn.execute("UPDATE agent_run SET output_path=? WHERE run_id=?",
+                 (str(immutable_output), run_id))
+
     # persist claims + role output; advance state
     for c in claims:
         conn.execute(
             "INSERT OR REPLACE INTO claim(claim_id, case_id, bundle_version, role,"
             " claim_type, material, text, source_id, locator, quote, quant_ref,"
             " temporal_basis, verification, verification_note,"
-            " verification_detail)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (f"{case_id}:{role}:{c.get('id')}", case_id, case["bundle_version"],
+            " verification_detail, origin_run_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"{case_id}:{role}:{c.get('id')}", case_id,
+             case["bundle_version"] + 1 if role == "search"
+             else case["bundle_version"],
              role, c.get("type"), 1 if c.get("material") else 0, c.get("text"),
              c.get("source_id"), c.get("locator"), c.get("quote"),
              c.get("quant_ref"), c.get("temporal_basis"),
              c.get("verification", "SUPPORTED"), c.get("verification_note"),
              json.dumps(c.get("verification_detail"), ensure_ascii=False)
-             if c.get("verification_detail") else None))
+             if c.get("verification_detail") else None, run_id))
     (case_dir(case_id) / f"{role}_output_latest.json").write_bytes(raw)
     if role == "semantic_review":
         _apply_semantic_rulings(conn, case, doc, dry_run=False)
@@ -813,6 +946,12 @@ def import_role_output(conn: sqlite3.Connection, cfg, case_id: str, role: str,
         report["decision"] = decision
     else:
         _set_state(conn, case_id, _ROLE_NEXT[role])
+    if pair_id and role in ("constructive", "adversarial"):
+        conn.execute(
+            "UPDATE analysis_pair SET first_output_at_utc="
+            "COALESCE(first_output_at_utc, ?), status=? WHERE pair_id=?",
+            (utc_now(), "COMPLETE" if role == "adversarial" else "OPEN",
+             pair_id))
     conn.commit()
     return report
 
@@ -837,35 +976,75 @@ def freeze_dossier(conn: sqlite3.Connection, case_id: str) -> dict:
     thesis = _latest_output(case_id, "constructive") or {}
     challenge = _latest_output(case_id, "adversarial") or {}
     claims = [dict(r) for r in conn.execute(
-        "SELECT * FROM claim WHERE case_id=? ORDER BY role, claim_id", (case_id,))]
+        "SELECT * FROM claim WHERE case_id=? AND bundle_version=?"
+        " ORDER BY role, claim_id", (case_id, case["bundle_version"]))]
     runs = [dict(r) for r in conn.execute(
-        "SELECT role, model_id, provider, runtime, status FROM agent_run"
-        " WHERE case_id=? AND status='IMPORTED' ORDER BY started_at_utc",
-        (case_id,))]
-    providers = {r["provider"] for r in runs if r["role"] in
-                 ("constructive", "adversarial", "adjudicator")}
+        "SELECT role, model_id, provider, runtime, status, pair_id,"
+        " agent_instance_id, context_id, context_provenance, visible_roles_json"
+        ", input_manifest_verified"
+        " FROM agent_run WHERE case_id=? AND status='IMPORTED'"
+        " ORDER BY started_at_utc", (case_id,))]
+    pair = conn.execute(
+        "SELECT * FROM analysis_pair WHERE case_id=? AND bundle_version=?"
+        " AND loop_index=? ORDER BY created_at_utc DESC LIMIT 1",
+        (case_id, case["bundle_version"], case["loop_count"])).fetchone()
+    analyst_runs = [r for r in runs if pair and r["pair_id"] == pair["pair_id"]
+                    and r["role"] in ("constructive", "adversarial")]
+    by_role = {r["role"]: r for r in analyst_runs}
+    pair_complete = set(by_role) == {"constructive", "adversarial"}
+    contexts = {r["context_id"] for r in analyst_runs if r["context_id"]}
+    agents = {r["agent_instance_id"] for r in analyst_runs
+              if r["agent_instance_id"]}
+    blind_inputs = all(not json.loads(r["visible_roles_json"] or "[]")
+                       and r["input_manifest_verified"] for r in analyst_runs)
+    independent = (pair_complete and len(contexts) == 2 and len(agents) == 2
+                   and blind_inputs)
+    provenances = {r["context_provenance"] for r in analyst_runs}
+    context_proof = ("runtime-verified" if pair_complete and provenances <=
+                     {"RUNTIME_VERIFIED", "FRESH_PROCESS_VERIFIED"}
+                     else "caller-declared" if pair_complete
+                     else "legacy/unknown")
+    analyst_providers = {r["provider"] for r in analyst_runs}
+    analyst_models = {r["model_id"] for r in analyst_runs}
     role_runs = ", ".join(f"{r['role']}={r['model_id']}" for r in runs)
+    canonical_decision = case["state"]
+    agent_decision = adj.get("decision")
+    normalization_note = (
+        f" · Agent 原始建议 {agent_decision}（研究环上限后由状态机规范化）"
+        if agent_decision and agent_decision != canonical_decision else "")
+    if pair:
+        independence_line = (
+            f"两个盲评 Agent：{'已完成' if pair_complete else '未完成'}"
+            f" · 逻辑独立性：{'满足' if independent else '未验证'}"
+            f" · 上下文凭证：{context_proof}"
+            f" · provider/model 数：{len(analyst_providers)}/"
+            f"{len(analyst_models)}（仅披露，不作门槛）"
+        )
+    else:
+        independence_line = "LEGACY_CONTEXT_UNVERIFIED（旧运行无法追溯上下文隔离）"
     lines = [
         f"# 研究档案：{case['ticker']}（case {case_id}）",
         "",
-        f"- **裁决**: {adj.get('decision', case['state'])}"
+        f"- **裁决**: {canonical_decision}{normalization_note}"
         f" · 置信 {adj.get('confidence', '?')}"
         f" · 决策截止 {case['decision_cutoff_utc']}"
         f" · 证据束 v{case['bundle_version']} · 研究环 {case['loop_count']}",
-        f"- **独立性**: "
-        f"{'REDUCED_INDEPENDENCE（单一提供商 C1）' if len(providers) <= 1 else '多提供商'}"
-        f" · 角色运行: {role_runs}",
+        f"- **独立性**: {independence_line} · 角色运行: {role_runs}",
         "",
         "## 裁决理由",
         adj.get("rationale_zh", "（无）"),
         "",
         "## 建设性论点（仅通过校验的声明）",
         thesis.get("thesis_summary_zh", "（无）"),
+        f"- 独立判断: {thesis.get('independent_verdict', '?')}"
+        f" · 置信 {thesis.get('verdict_confidence', '?')}",
         f"- 机制: {thesis.get('mechanism', '?')} · 效应分类: "
         f"{thesis.get('effect_classification', '?')}",
         "",
         "## 对抗性挑战",
         challenge.get("rationality_case", "（无）"),
+        f"- 独立判断: {challenge.get('independent_verdict', '?')}"
+        f" · 置信 {challenge.get('verdict_confidence', '?')}",
         "",
         "## 裁决理由（结构化，全部经校验）",
     ]
@@ -960,16 +1139,20 @@ def freeze_dossier(conn: sqlite3.Connection, case_id: str) -> dict:
          str(path), case["config_version"] or ""))
     conn.commit()
     return {"artifact_id": artifact_id, "path": str(path), "sha256": sha,
-            "decision": adj.get("decision", case["state"])}
+            "decision": canonical_decision,
+            "agent_decision": agent_decision}
 
 
 # ------------------------------------------- semantic review + reasons (H1.1)
 
 
-def _lookup_claim(conn, case_id: str, cid: str):
+def _lookup_claim(conn, case_id: str, cid: str,
+                  bundle_version: int | None = None):
     row = conn.execute("SELECT * FROM claim WHERE case_id=? AND"
+                       " (? IS NULL OR bundle_version=?) AND"
                        " (claim_id=? OR claim_id LIKE ?)",
-                       (case_id, cid, f"{case_id}:%:{cid}")).fetchone()
+                       (case_id, bundle_version, bundle_version, cid,
+                        f"{case_id}:%:{cid}")).fetchone()
     return row
 
 
@@ -982,7 +1165,7 @@ def _apply_semantic_rulings(conn, case, doc: dict, *, dry_run: bool) -> list[str
     ruled: dict[str, dict] = {}
     for r in doc.get("rulings") or []:
         cid = r.get("claim_id") or ""
-        row = _lookup_claim(conn, case["case_id"], cid)
+        row = _lookup_claim(conn, case["case_id"], cid, case["bundle_version"])
         if row is None:
             problems.append(f"ruling references unknown claim {cid}")
             continue
@@ -993,7 +1176,9 @@ def _apply_semantic_rulings(conn, case, doc: dict, *, dry_run: bool) -> list[str
         ruled[row["claim_id"]] = r
     unruled = [r["claim_id"] for r in conn.execute(
         "SELECT claim_id FROM claim WHERE case_id=? AND claim_type='FACTUAL'"
-        " AND material=1", (case["case_id"],)) if r["claim_id"] not in ruled]
+        " AND material=1 AND bundle_version=?",
+        (case["case_id"], case["bundle_version"]))
+        if r["claim_id"] not in ruled]
     if unruled:
         problems.append("material FACTUAL claims not ruled: "
                         + ", ".join(sorted(unruled)[:6])
@@ -1001,7 +1186,8 @@ def _apply_semantic_rulings(conn, case, doc: dict, *, dry_run: bool) -> list[str
     if problems or dry_run:
         return problems
     for claim_id, r in ruled.items():
-        row = _lookup_claim(conn, case["case_id"], claim_id)
+        row = _lookup_claim(conn, case["case_id"], claim_id,
+                            case["bundle_version"])
         detail = json.loads(row["verification_detail"] or "{}")
         detail["semantic"] = r["ruling"]
         detail["semantic_explanation"] = r.get("explanation")
@@ -1043,7 +1229,8 @@ def _validate_decision_reasons(conn, case, doc: dict,
             if not cids:
                 problems.append(f"reason {rid}: claim_ids required")
             for cid in cids:
-                row = _lookup_claim(conn, case["case_id"], cid)
+                row = _lookup_claim(conn, case["case_id"], cid,
+                                    case["bundle_version"])
                 if row is None:
                     problems.append(f"reason {rid}: unknown claim {cid}")
                     continue
@@ -1085,9 +1272,11 @@ def _validate_decision_reasons(conn, case, doc: dict,
                             " or resolve the gap")
         bad = conn.execute(
             "SELECT COUNT(*) FROM claim WHERE case_id=? AND material=1"
+            " AND bundle_version=?"
             " AND claim_type='FACTUAL' AND (verification_detail IS NULL OR"
             " json_extract(verification_detail,'$.semantic')"
-            " != 'SEMANTICALLY_SUPPORTED')", (case["case_id"],)).fetchone()[0]
+            " != 'SEMANTICALLY_SUPPORTED')",
+            (case["case_id"], case["bundle_version"])).fetchone()[0]
         if bad:
             problems.append(f"QUALIFIED_CANDIDATE with {bad} material factual"
                             " claims lacking full semantic support")
@@ -1107,10 +1296,13 @@ def rank_cases(conn: sqlite3.Connection) -> dict:
         adj = _latest_output(rc["case_id"], "adjudicator") or {}
         qp_path = case_dir(rc["case_id"]) / "quantpack_latest.json"
         qp = json.loads(qp_path.read_text()) if qp_path.exists() else {}
+        canonical_decision = (rc["state"] if rc["state"] in FINAL_STATES
+                              else adj.get("decision", rc["state"]))
         rows.append({
             "case_id": rc["case_id"], "ticker": rc["ticker"],
             "state": rc["state"],
-            "decision": adj.get("decision", rc["state"]),
+            "decision": canonical_decision,
+            "agent_decision": adj.get("decision"),
             "opportunity_confidence": adj.get("opportunity_confidence"),
             "evidence_confidence": adj.get("evidence_confidence"),
             "quant_confidence": adj.get("quant_confidence"),
