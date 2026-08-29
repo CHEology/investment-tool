@@ -26,8 +26,14 @@ COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik10}.json"
 
 REVENUE_TAGS = ("RevenueFromContractWithCustomerExcludingAssessedTax",
                 "Revenues", "RevenueFromContractWithCustomerIncludingAssessedTax")
+SHARES_TAGS = ("EntityCommonStockSharesOutstanding",
+               "CommonStockSharesOutstanding", "CommonStockSharesIssued",
+               "WeightedAverageNumberOfDilutedSharesOutstanding")
 KEEP_TAGS = {
     ("dei", "EntityCommonStockSharesOutstanding"),
+    ("us-gaap", "CommonStockSharesOutstanding"),
+    ("us-gaap", "CommonStockSharesIssued"),
+    ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding"),
     ("us-gaap", "Revenues"),
     ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"),
     ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax"),
@@ -86,11 +92,17 @@ def fetch_companyfacts(conn: sqlite3.Connection, cfg, http, cik: str) -> dict:
 def shares_outstanding(conn: sqlite3.Connection, cik: str, asof: str) -> dict:
     """Latest cover-page share count filed on/before asof; same-period-end
     class rows are summed (multi-class approximation, flagged)."""
-    rows = conn.execute(
-        "SELECT period_end, value, filed_date FROM xbrl_fact WHERE cik=?"
-        " AND tag='EntityCommonStockSharesOutstanding' AND filed_date<=?"
-        " ORDER BY period_end DESC, filed_date DESC", (str(int(cik)), asof),
-    ).fetchall()
+    rows = []
+    used_tag = None
+    for tag in SHARES_TAGS:
+        rows = conn.execute(
+            "SELECT period_end, value, filed_date FROM xbrl_fact WHERE cik=?"
+            " AND tag=? AND filed_date<=?"
+            " ORDER BY period_end DESC, filed_date DESC",
+            (str(int(cik)), tag, asof)).fetchall()
+        if rows:
+            used_tag = tag
+            break
     if not rows:
         return {"quality": "MISSING", "value": None}
     latest_end = rows[0]["period_end"]
@@ -99,10 +111,14 @@ def shares_outstanding(conn: sqlite3.Connection, cik: str, asof: str) -> dict:
     newest_filed = max(r["filed_date"] for r in same)
     vals = [float(r["value"]) for r in same if r["filed_date"] == newest_filed]
     total = sum(vals)
+    quality = "OK" if len(vals) == 1 else "APPROX_MULTI_CLASS"
+    if used_tag == "WeightedAverageNumberOfDilutedSharesOutstanding":
+        quality = "APPROX_WEIGHTED_DILUTED"
+    elif used_tag != "EntityCommonStockSharesOutstanding":
+        quality = "APPROX_BALANCE_SHEET_TAG"
     return {"value": total, "period_end": latest_end,
-            "filed_date": newest_filed,
-            "class_rows": len(vals),
-            "quality": "OK" if len(vals) == 1 else "APPROX_MULTI_CLASS"}
+            "filed_date": newest_filed, "tag": used_tag,
+            "class_rows": len(vals), "quality": quality}
 
 
 def ttm_revenue(conn: sqlite3.Connection, cik: str, asof: str) -> dict:
@@ -197,8 +213,9 @@ def ps_ratio_history(conn: sqlite3.Connection, cik: str, listing_id: str,
     extended price history; quality reflects sample size."""
     ends = [r["period_end"] for r in conn.execute(
         "SELECT DISTINCT period_end FROM xbrl_fact WHERE cik=?"
-        " AND tag='EntityCommonStockSharesOutstanding' AND filed_date<=?"
-        " ORDER BY period_end", (str(int(cik)), asof))]
+        " AND tag IN ({}) AND filed_date<=?"
+        " ORDER BY period_end".format(",".join("?" * len(SHARES_TAGS))),
+        (str(int(cik)), *SHARES_TAGS, asof))]
     history = []
     for end in ends:
         rev = ttm_revenue(conn, cik, end)
