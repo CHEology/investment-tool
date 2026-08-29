@@ -198,6 +198,46 @@ def _has_completed_web_search(jsonl: str) -> bool:
     return False
 
 
+def _parse_agent_json(raw: str) -> dict:
+    """Parse one Agent JSON object, tolerating only identical duplication.
+
+    Some CLI runs have emitted the same final JSON object twice with no
+    separator. Collapsing byte-different but structurally identical objects is
+    mechanical and cannot change the research conclusion. Multiple distinct
+    objects remain ambiguous and are rejected.
+    """
+    start = raw.find("{")
+    if start < 0:
+        raise RuntimeError("Codex Agent returned no JSON object")
+    payload = raw[start:].strip()
+    decoder = json.JSONDecoder()
+    docs: list[dict] = []
+    pos = 0
+    while pos < len(payload):
+        while pos < len(payload) and payload[pos].isspace():
+            pos += 1
+        if pos == len(payload):
+            break
+        # A completed object followed only by unmatched closing braces carries
+        # no additional data. Treat it as CLI/model syntax noise, while any
+        # other trailing content remains an error.
+        if docs and set(payload[pos:].strip()) == {"}"}:
+            break
+        try:
+            doc, end = decoder.raw_decode(payload, pos)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Codex Agent returned invalid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise RuntimeError("Codex Agent JSON output must be an object")
+        docs.append(doc)
+        pos = end
+    if not docs:
+        raise RuntimeError("Codex Agent returned no JSON object")
+    if any(doc != docs[0] for doc in docs[1:]):
+        raise RuntimeError("Codex Agent returned multiple non-identical JSON objects")
+    return docs[0]
+
+
 def _ensure_blind_pair(conn, case_id: str) -> dict:
     """Freeze both analyst work orders before either analyst output exists.
 
@@ -463,15 +503,8 @@ class CodexCLIAdapter:
             raise RuntimeError(f"Codex Agent failed: {tail}")
         if not output.exists():
             raise RuntimeError("Codex Agent returned no output file")
-        raw = output.read_text().strip()
-        start, end = raw.find("{"), raw.rfind("}")
-        if start < 0 or end <= start:
-            raise RuntimeError("Codex Agent returned no JSON object")
-        final_json = raw[start:end + 1]
-        try:
-            doc = json.loads(final_json)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Codex Agent returned invalid JSON: {exc}") from exc
+        doc = _parse_agent_json(output.read_text())
+        final_json = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
         if (order["role"] == "search" and doc.get("search_state") == "COMPLETE"
                 and not _has_completed_web_search(stdout)):
             raise RuntimeError("search claimed COMPLETE without a Web Search trace")

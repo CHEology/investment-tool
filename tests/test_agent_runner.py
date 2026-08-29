@@ -370,6 +370,15 @@ def test_completed_web_search_requires_completed_tool_event():
         '"action":{"type":"search","query":"q"}}}')
 
 
+def test_agent_json_parser_collapses_only_identical_duplicate_objects():
+    one = {"role": "search", "search_state": "COMPLETE", "queries": ["q"]}
+    encoded = json.dumps(one)
+    assert agent_runner._parse_agent_json(encoded + encoded) == one
+    assert agent_runner._parse_agent_json(encoded + "}}") == one
+    with pytest.raises(RuntimeError, match="multiple non-identical"):
+        agent_runner._parse_agent_json(encoded + json.dumps({**one, "queries": ["x"]}))
+
+
 def test_non_search_codex_agent_has_web_and_shell_network_disabled(conn, cfg):
     case = _open(conn, cfg)
     research.freeze_bundle(conn, case["case_id"])
@@ -405,12 +414,41 @@ def test_non_search_codex_agent_has_web_and_shell_network_disabled(conn, cfg):
 def test_work_orders_use_current_versioned_contracts(conn, cfg):
     case = _open(conn, cfg)
     research.freeze_bundle(conn, case["case_id"])
-    expected = {"search": "search_v2.md", "constructive": "constructive_v2.md",
-                "adversarial": "adversarial_v2.md",
+    expected = {"search": "search_v2.md", "constructive": "constructive_v3.md",
+                "adversarial": "adversarial_v3.md",
+                "rebuttal": "rebuttal_v2.md",
                 "adjudicator": "adjudicator_v3.md"}
     for role, filename in expected.items():
         view = research.export_role_view(conn, case["case_id"], role)
         assert view["contract"].endswith(filename)
+        if role in ("constructive", "adversarial", "rebuttal"):
+            contract = Path(view["contract"]).read_text()
+            assert '`id`、`type`、`material`、`text`' in contract
+            assert "不得**添加 `quantpack.` 前缀" in contract
+
+
+def test_semantic_review_view_contains_every_material_factual_claim(conn, cfg):
+    case = _open(conn, cfg)
+    research.freeze_bundle(conn, case["case_id"])
+    conn.execute(
+        "INSERT INTO claim(claim_id,case_id,bundle_version,role,claim_type,"
+        "material,text,source_id,quote,verification) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (f"{case['case_id']}:constructive:C1", case["case_id"], 1,
+         "constructive", "FACTUAL", 1, "material fact", "evd_example",
+         "exact passage", "SUPPORTED"))
+    conn.execute(
+        "INSERT INTO claim(claim_id,case_id,bundle_version,role,claim_type,"
+        "material,text,verification) VALUES(?,?,?,?,?,?,?,?)",
+        (f"{case['case_id']}:constructive:C2", case["case_id"], 1,
+         "constructive", "NUMERIC", 1, "number", "RECOMPUTED_OK"))
+    conn.commit()
+
+    view = research.export_role_view(conn, case["case_id"], "semantic_review")
+    payload = json.loads((Path(view["role_dir"]) / "input.json").read_text())
+
+    assert [c["claim_id"] for c in payload["claims"]] == [
+        f"{case['case_id']}:constructive:C1"]
+    assert payload["claims"][0]["quote"] == "exact passage"
 
 
 @pytest.mark.skipif(os.environ.get("RUN_CODEX_LIVE") != "1",

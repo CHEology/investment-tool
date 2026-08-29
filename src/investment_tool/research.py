@@ -35,8 +35,9 @@ ROLES = ("search", "constructive", "adversarial", "rebuttal", "semantic_review",
          "adjudicator")
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 PROMPT_VERSIONS = {role: f"{role}_v1" for role in ROLES}
-PROMPT_VERSIONS.update({"search": "search_v2", "constructive": "constructive_v2",
-                        "adversarial": "adversarial_v2",
+PROMPT_VERSIONS.update({"search": "search_v2", "constructive": "constructive_v3",
+                        "adversarial": "adversarial_v3",
+                        "rebuttal": "rebuttal_v2",
                         "adjudicator": "adjudicator_v3"})
 MAX_LOOPS = 2
 # Opportunity states (H1.1/F-J): research sufficiency and opportunity ranking
@@ -338,6 +339,13 @@ def export_role_view(conn: sqlite3.Connection, case_id: str, role: str) -> dict:
                   "prompt_version": prompt_version}
     if role == "rebuttal":
         view["challenge"] = _latest_output(case_id, "adversarial")
+    if role == "semantic_review":
+        view["claims"] = [dict(r) for r in conn.execute(
+            "SELECT claim_id, role, claim_type, material, text, source_id,"
+            " locator, quote, temporal_basis, verification, verification_detail"
+            " FROM claim WHERE case_id=? AND bundle_version=?"
+            " AND claim_type='FACTUAL' AND material=1 ORDER BY claim_id",
+            (case_id, version))]
     if role == "adjudicator":
         view["claims"] = [dict(r) for r in conn.execute(
             "SELECT * FROM claim WHERE case_id=? AND bundle_version=?"
@@ -999,6 +1007,11 @@ def freeze_dossier(conn: sqlite3.Connection, case_id: str) -> dict:
     analyst_providers = {r["provider"] for r in analyst_runs}
     analyst_models = {r["model_id"] for r in analyst_runs}
     role_runs = ", ".join(f"{r['role']}={r['model_id']}" for r in runs)
+    canonical_decision = case["state"]
+    agent_decision = adj.get("decision")
+    normalization_note = (
+        f" · Agent 原始建议 {agent_decision}（研究环上限后由状态机规范化）"
+        if agent_decision and agent_decision != canonical_decision else "")
     if pair:
         independence_line = (
             f"两个盲评 Agent：{'已完成' if pair_complete else '未完成'}"
@@ -1012,7 +1025,7 @@ def freeze_dossier(conn: sqlite3.Connection, case_id: str) -> dict:
     lines = [
         f"# 研究档案：{case['ticker']}（case {case_id}）",
         "",
-        f"- **裁决**: {adj.get('decision', case['state'])}"
+        f"- **裁决**: {canonical_decision}{normalization_note}"
         f" · 置信 {adj.get('confidence', '?')}"
         f" · 决策截止 {case['decision_cutoff_utc']}"
         f" · 证据束 v{case['bundle_version']} · 研究环 {case['loop_count']}",
@@ -1126,7 +1139,8 @@ def freeze_dossier(conn: sqlite3.Connection, case_id: str) -> dict:
          str(path), case["config_version"] or ""))
     conn.commit()
     return {"artifact_id": artifact_id, "path": str(path), "sha256": sha,
-            "decision": adj.get("decision", case["state"])}
+            "decision": canonical_decision,
+            "agent_decision": agent_decision}
 
 
 # ------------------------------------------- semantic review + reasons (H1.1)
@@ -1282,10 +1296,13 @@ def rank_cases(conn: sqlite3.Connection) -> dict:
         adj = _latest_output(rc["case_id"], "adjudicator") or {}
         qp_path = case_dir(rc["case_id"]) / "quantpack_latest.json"
         qp = json.loads(qp_path.read_text()) if qp_path.exists() else {}
+        canonical_decision = (rc["state"] if rc["state"] in FINAL_STATES
+                              else adj.get("decision", rc["state"]))
         rows.append({
             "case_id": rc["case_id"], "ticker": rc["ticker"],
             "state": rc["state"],
-            "decision": adj.get("decision", rc["state"]),
+            "decision": canonical_decision,
+            "agent_decision": adj.get("decision"),
             "opportunity_confidence": adj.get("opportunity_confidence"),
             "evidence_confidence": adj.get("evidence_confidence"),
             "quant_confidence": adj.get("quant_confidence"),

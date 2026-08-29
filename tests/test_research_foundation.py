@@ -2,6 +2,7 @@
 freezing, and the mechanical claim validators. Offline throughout."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -389,3 +390,11 @@ def test_research_request_loop_is_bounded(conn, cfg, tmp_path):
     st = conn.execute("SELECT state, loop_count FROM research_case"
                       " WHERE case_id=?", (case["case_id"],)).fetchone()
     assert st["state"] == "UNRESOLVED" and st["loop_count"] == 2
+    dossier = research.freeze_dossier(conn, case["case_id"])
+    assert dossier["decision"] == "UNRESOLVED"
+    assert dossier["agent_decision"] == "RESEARCH_REQUESTED"
+    assert "**裁决**: UNRESOLVED" in Path(dossier["path"]).read_text()
+    ranked_case = next(r for r in research.rank_cases(conn)["unresolved"]
+                       if r["case_id"] == case["case_id"])
+    assert ranked_case["decision"] == "UNRESOLVED"
+    assert ranked_case["agent_decision"] == "RESEARCH_REQUESTED"

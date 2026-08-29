@@ -81,7 +81,11 @@ def fetch_primary_document(conn: sqlite3.Connection, cfg, http, accession: str) 
 # ---- deterministic content assessment (trial tier; keyword rules, versioned) ----
 
 CONTENT_RULES = [
-    ("non_reliance_restatement", r"non-reliance|should no longer be relied|restat(e|ement)"),
+    ("non_reliance_restatement",
+     r"non-reliance|should no longer be relied|"
+     r"(?:restate(?:d|ment|ments|ing)?\s+(?:our\s+|the\s+)?"
+     r"(?:previously issued\s+)?financial statements?|"
+     r"financial statements?.{0,80}(?:restate|restatement))"),
     ("bankruptcy_distress", r"chapter 11|chapter 7|bankruptcy|going concern"),
     ("delisting_compliance",
      r"delist|listing (qualification|standard|compliance)|continued listing"),
@@ -97,7 +101,7 @@ CONTENT_RULES = [
                           r"|preliminary (unaudited )?results"),
 ]
 
-CONTENT_VERSION = "us_trial_content_v0"
+CONTENT_VERSION = "us_trial_content_v1"
 
 
 def assess_content(text: str, items_csv: str | None) -> dict:
