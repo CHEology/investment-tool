@@ -84,7 +84,7 @@ date,symbol,exchange,currency,open,high,low,close,adj_close,volume
 
 日线 VWAP 缺失，Alpha158 中对应特征保持缺失值，由 LightGBM 处理。模拟允许碎股，现金收益设为零；尚未加入税费、成交容量、停牌成交处理和行业权重约束。`max_weight` 是调仓目标上限，持有期间权重随价格漂移。
 
-GPT 基本面解读、Telegram 发送、持仓导入、定时调度和 A 股尚未接入。当前 `review-packet.json` 列出需要补充的证据，不生成没有来源的解释。旧定时任务已经停用。
+Codex 已串联 IBKR 只读持仓、官方来源复核、中文日报和当前聊天的定时运行。`daily` 生成资料包，`brief` 将经复核的判断与计算结果汇总；仅运行 `research` 仍然输出量化研究报告。Telegram 发送和 A 股尚未接入，旧定时任务已经停用。
 
 具体评估和后续顺序见 [方案评估](docs/ASSESSMENT.md)，计算约定见 [设计](docs/DESIGN.md)。
 
@@ -98,4 +98,4 @@ uv run --no-sync pytest -q
 
 测试覆盖数据质量、证据完整性、标签边界、未来数据不影响历史特征、次日执行、交易成本及真实 Qlib 集成。CI 使用同一套依赖和检查。
 
-代码组织保持简单：`data` / `providers` 管输入，`qlib_engine` 管特征和训练，`backtest` 管收益计算，`pipeline` 串联流程，`watch` 记录候选变化。没有旧代码兼容层。
+代码组织保持简单：`data` / `providers` 管输入，`qlib_engine` 管特征和训练，`backtest` 管收益计算，`pipeline` 串联回测，`daily` 更新每日资料，`brief` 输出日报，`watch` 记录独立回测的候选变化。没有旧代码兼容层。
