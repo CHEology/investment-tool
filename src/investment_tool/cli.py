@@ -10,9 +10,12 @@ from .providers import fetch_yahoo
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Qlib US equity research assistant")
+    parser = argparse.ArgumentParser(description="Qlib equity research assistant")
     parser.add_argument("--root", type=Path, default=Path("artifacts"))
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("cn-data", help="Download the pinned Qlib historical China dataset")
+    cn = sub.add_parser("cn-benchmark", help="Run the official CSI300 Alpha158/LightGBM workflow")
+    cn.add_argument("--threads", type=int, default=20)
     sub.add_parser("demo", help="Run real Qlib on deterministic synthetic prices")
     fetch = sub.add_parser("fetch", help="Fetch a static US research sample, including SPY")
     fetch.add_argument("--symbols", required=True, help="Comma-separated Yahoo symbols")
@@ -35,7 +38,15 @@ def main(argv=None) -> int:
     brief.add_argument("day", type=Path)
     args = parser.parse_args(argv)
     try:
-        if args.command == "fetch":
+        if args.command == "cn-data":
+            from .cn import prepare_data
+
+            path = prepare_data(args.root)
+        elif args.command == "cn-benchmark":
+            from .cn import benchmark
+
+            path = benchmark(args.root, args.threads)
+        elif args.command == "fetch":
             path = fetch_yahoo(
                 [s.strip().upper() for s in args.symbols.split(",")],
                 args.start,

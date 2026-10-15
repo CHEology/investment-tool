@@ -1,0 +1,75 @@
+{
+  "run_id": "20261015T033136585144Z",
+  "qlib_commit": "54355232463878d2eebb91fe0ee5fa7fa1f5976c",
+  "versions": {
+    "pyqlib": "0.9.8",
+    "lightgbm": "4.7.0",
+    "pandas": "2.3.3",
+    "numpy": "2.5.4"
+  },
+  "data_sha256": "8a323fec32e1bd0c1662c1fc753ad033f190523e450936e63c9509796ea32e41",
+  "official_config_sha256": "0cbe1f729f43a2b8cd735759e6244c2e9f8db967555bfe24a7143fce4605d680",
+  "data_quality": "failed",
+  "investment_qualification": "blocked_by_data_quality",
+  "comparison_6_vs_20_threads": {
+    "predictions_identical": true,
+    "max_daily_return_difference": 1.1032841307212493e-15
+  },
+  "results": {
+    "start": "2017-01-03",
+    "end": "2020-07-31",
+    "sessions": 871,
+    "metrics": {
+      "IC": 0.04680478548401019,
+      "ICIR": 0.3815580412040698,
+      "Rank IC": 0.04904972522499881,
+      "Rank ICIR": 0.4067533437693986,
+      "1day.excess_return_with_cost.annualized_return": 0.08065424981584747,
+      "1day.excess_return_with_cost.information_ratio": 0.914485885601076,
+      "1day.excess_return_with_cost.max_drawdown": -0.08608280684938355
+    },
+    "official_reference": {
+      "IC": 0.0448,
+      "ICIR": 0.366,
+      "Rank IC": 0.0469,
+      "Rank ICIR": 0.3877,
+      "1day.excess_return_with_cost.annualized_return": 0.0901,
+      "1day.excess_return_with_cost.information_ratio": 1.0164,
+      "1day.excess_return_with_cost.max_drawdown": -0.1038
+    },
+    "portfolio_total_return_with_cost": 0.862326830107635,
+    "portfolio_max_drawdown_with_cost": -0.24699440818742313,
+    "benchmark_total_return": 0.4184088668631627,
+    "annual": [
+      {
+        "year": 2017,
+        "sessions": 244,
+        "portfolio_return": 0.35151601880169214,
+        "benchmark_return": 0.21774988972253428,
+        "mean_rank_ic": 0.06859872056000753
+      },
+      {
+        "year": 2018,
+        "sessions": 243,
+        "portfolio_return": -0.1823502336294106,
+        "benchmark_return": -0.2530980315292223,
+        "mean_rank_ic": 0.049482605579791054
+      },
+      {
+        "year": 2019,
+        "sessions": 244,
+        "portfolio_return": 0.3653487865697109,
+        "benchmark_return": 0.3606961884944224,
+        "mean_rank_ic": 0.033189603792579334
+      },
+      {
+        "year": 2020,
+        "sessions": 140,
+        "portfolio_return": 0.23430866238154224,
+        "benchmark_return": 0.14608958593144794,
+        "mean_rank_ic": 0.04152932863397341
+      }
+    ],
+    "metric_definition": "官方表的年化超额收益为每日(组合收益−成本−指数收益)均值×238；回撤也是该超额收益算术累计曲线的回撤，均不是账户复合年收益或账户净值回撤。"
+  }
+}
