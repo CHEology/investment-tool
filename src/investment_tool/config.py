@@ -1,67 +1,47 @@
-"""Versioned threshold/config registry (DESIGN 10, 13).
-
-Every threshold lives in config/thresholds/<id>.yaml with EXPERIMENTAL status
-until forward evidence supports validation. Changes are forward-only: a new
-file (or dated changelog entry) creates a new config_version row; runs stamp
-the version they used.
-"""
-
-from __future__ import annotations
-
-import hashlib
-import sqlite3
+import tomllib
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import yaml
 
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config" / "thresholds"
+@dataclass(frozen=True)
+class ResearchConfig:
+    horizon: int = 20
+    train_sessions: int = 504
+    valid_sessions: int = 126
+    test_sessions: int = 63
+    warmup_sessions: int = 60
+    top_k: int = 10
+    max_weight: float = 0.1
+    cost_bps: float = 15.0
+    benchmark: str = "SPY"
+    seed: int = 42
+    num_boost_round: int = 200
+
+    def __post_init__(self):
+        for name in (
+            "horizon",
+            "train_sessions",
+            "valid_sessions",
+            "test_sessions",
+            "warmup_sessions",
+            "top_k",
+            "num_boost_round",
+        ):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.warmup_sessions < 60:
+            raise ValueError("Alpha158 needs at least 60 warmup sessions")
+        if not 0 < self.max_weight <= 1 or not 0 <= self.cost_bps < 1000:
+            raise ValueError("Invalid concentration cap or transaction cost")
+        if self.top_k * self.max_weight > 1.0000001:
+            raise ValueError("top_k * max_weight must not exceed 1")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
-class Config:
-    def __init__(self, config_id: str, data: dict, yaml_sha256: str):
-        self.id = config_id
-        self.data = data
-        self.yaml_sha256 = yaml_sha256
-
-    def get(self, dotted: str):
-        node = self.data
-        for part in dotted.split("."):
-            if not isinstance(node, dict) or part not in node:
-                raise KeyError(f"config key missing: {dotted}")
-            node = node[part]
-        return node
-
-    def value(self, dotted: str):
-        """Threshold entries are {value, status, purpose, ...}; return value."""
-        node = self.get(dotted)
-        if isinstance(node, dict) and "value" in node:
-            return node["value"]
-        return node
-
-
-def load(config_id: str = "v0", config_dir: Path | None = None) -> Config:
-    path = (config_dir or CONFIG_DIR) / f"{config_id}.yaml"
-    raw = path.read_bytes()
-    return Config(config_id, yaml.safe_load(raw), hashlib.sha256(raw).hexdigest())
-
-
-def register(conn: sqlite3.Connection, cfg: Config, changelog: str = "") -> str:
-    row = conn.execute(
-        "SELECT yaml_sha256 FROM config_version WHERE id=?", (cfg.id,)
-    ).fetchone()
-    if row is not None:
-        if row["yaml_sha256"] != cfg.yaml_sha256:
-            raise RuntimeError(
-                f"config '{cfg.id}' content changed but id did not; thresholds are"
-                " forward-only — create a new config id instead of editing in place"
-            )
-        return cfg.id
-    from investment_tool.lineage import utc_now
-
-    conn.execute(
-        "INSERT INTO config_version(id, yaml_sha256, effective_from_utc, changelog)"
-        " VALUES(?,?,?,?)",
-        (cfg.id, cfg.yaml_sha256, utc_now(), changelog),
-    )
-    conn.commit()
-    return cfg.id
+def load_config(path: Path | None) -> ResearchConfig:
+    if path is None:
+        return ResearchConfig()
+    with path.open("rb") as handle:
+        return ResearchConfig(**tomllib.load(handle)["research"])

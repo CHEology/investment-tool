@@ -1,24 +1,18 @@
-name: CI
-
+name: checks
 on:
-  pull_request:
   push:
-    branches: [main]
-
+  pull_request:
 permissions:
   contents: read
-
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
           enable-cache: true
-      - run: uv sync --extra dev
-      - run: uv run ruff check .
-      - run: uv run pytest -q
-      - run: uv run python -m compileall -q src tests
+      - run: uv sync --frozen --extra quant --extra dev --python 3.12
+      - run: uv run --no-sync ruff check src tests
+      - run: uv run --no-sync ruff format --check src tests
+      - run: uv run --no-sync pytest -q

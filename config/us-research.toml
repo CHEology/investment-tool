@@ -1,0 +1,12 @@
+[research]
+horizon = 20
+train_sessions = 504
+valid_sessions = 126
+test_sessions = 63
+warmup_sessions = 60
+top_k = 10
+max_weight = 0.10
+cost_bps = 15.0
+benchmark = "SPY"
+seed = 42
+num_boost_round = 200

@@ -1,202 +1,41 @@
-# DESIGN — binding baseline (approved 2026-08-28)
+# 计算约定
 
-This file condenses the approved FINAL PRE-IMPLEMENTATION DESIGN. Where this
-file and the approval conversation differ, the conversation's approved text
-governs. Invariants: docs/INVARIANTS.md. Thresholds: config/thresholds/
-(all EXPERIMENTAL until forward-validated).
+## 数据
 
-## Architecture
+美股日线按纽约交易日记录，交易日历使用 XNYS 会话。抓取保留原始响应、来源地址、UTC 获取时间和 SHA-256；转换后价格写入 CSV，运行记录连接输入和输出。报告和数据留在本地 `artifacts/`，不提交 GitHub。旧的 `data/` 目录不作为新程序输入。
 
-```
- [PRICE_FIRST]        [EVENT_FIRST]         [SECTOR_EVENT]      [standing queries]
- EOD spines,          CNInfo/EDGAR/          policy feeds,       watchlist+sector
- peer-adj AR          procurement/           exposure links      scoped, L0 only
- triggers+shadow      certification
-      \                    |                     |                   /
-       observations -> EVENT objects (HYPOTHESIZED -> VERIFIED/REFUTED/STALE)
-            | cause-hunt -> SearchPlan (Search Agent, bounded, web)
-            v
-  screening: integrity gates -> liquidity -> lane logic -> candidates (profiles,
-  lexicographic ranking, full rejection log)
-            v
-  Evidence Builder -> frozen content-addressed EvidenceBundle vN
-            v
-  Constructive <-blind-> Adversarial  (bundle-only, isolated, never web)
-            -> rebuttal (1 round) -> Adjudicator (claims+rebuttals only)
-            -> RESEARCH_REQUEST loop (<=2 cycles)
-            v
-  claim pipeline: locator check -> entailment -> deterministic recompute
-  UNSUPPORTED material claim => DOSSIER_BLOCKED
-            v
-  zh dossier -> frozen ThesisVersion -> monitoring watches -> forward validation
-```
+当前只接受共同交易区间、同币种、无重复、完整的价格面板。缺失和停牌需要后续显式建模，不通过填零或向前填充掩盖。高低开收必须满足价格关系，成交量为正整数。
 
-Every stage emits manifests, quality states, config version, and audit lines.
+Qlib 导出使用 `adj_close / close` 比率调整 OHLC，反向调整成交量；VWAP 留空。调整历史是抓取时点的数据快照，并非逐日保存的点时复权数据库。
 
-## Timestamps (approved condition 1)
+## 预测与实验
 
-Distinct where applicable: `published_at_utc` (source publication),
-`source_updated_at_utc` (source revision), `first_seen_at_utc` (our first
-detection; detection latency = first_seen - published; lookahead protection
-keys on first_seen), `retrieved_at_utc` (this fetch, in manifests).
+特征：官方 Alpha158，包含一个持续缺失的 VWAP 特征。LightGBM 使用缺失值原生处理，不使用全样本拟合的归一化器。标签先按当日股票截面转换为排名；模型分数是相对排序分数。
 
-## Lane A (S1)
+信号日为 t，标签是 `adjusted_close[t + 21] / adjusted_close[t + 1] - 1`。训练标签的最后价格必须早于验证开始；验证标签的最后价格必须早于测试开始。两个边界均跳过 21 个交易日。
 
-- t0 = first tradable session at-or-after disclosure timestamp.
-- Primary AR: r_i - median(r, PIT sector x size cell). Triggering gates on the
-  peer-adjusted CAR ONLY; the market-model CAR (beta 250d, min 120, winsorized,
-  size-segmented benchmark) is a post-trigger diagnostic on cards. (S1
-  clarification of the earlier "gate on the more conservative" wording.)
-- Return basis: analytical returns are basis-labeled per row (EXCHANGE_PCT /
-  QFQ_CONSEC / SYNTH_COMPOUND / RAW_CONSEC) with a per-listing basis_epoch;
-  windows mixing raw with adjusted lineage, or mixing epochs, are BLOCKED from
-  analytics. Corporate-action rewrites are detected by overlap checks and bump
-  the epoch. Raw prices remain canonical where sourced (docs/audit/
-  s1-adjudication.md issue 2).
-- PIT peers: industry snapshot per scan date; float-mcap terciles monthly;
-  min cell 8 -> broader-industry -> size-only -> market; suspended excluded;
-  limit-locked included with LIMIT_CONTAMINATED flag >20%.
-- Limit-locked closes pause the CAR window clock (cap +15 sessions);
-  discovery_state=INCOMPLETE until first free-trade close. Board limits:
-  MAIN 10%, ChiNext/STAR 20%, BSE 30%, ST 5%.
-- Trigger v0: peer-adj CAR[0,+3] <= -10% AND <= -3 sigma residual, OR any
-  VERIFIED negative event of listed types. Near-miss shadow log at 70%.
-- Attribution mandatory: no verified cause after SearchPlan exhaustion =>
-  REJECTED_NO_ATTRIBUTION (terminal, audited).
-- Damage templates v0: (1) market-access/regulatory exposure, (2) earnings
-  decomposition. Others reject explicitly (DAMAGE_MODEL_UNAVAILABLE).
-  Output [low, high] post-tax PV with sourced parameters.
-- EV<->equity reconciliation: damage is enterprise-cash-flow level; comparison
-  to |peer-adj dMcap| stated under debt-unimpaired assumption (survival floor
-  checks it); repricing-wedge attribution acknowledged in profiles.
-- Classification PRICED_LESS | WITHIN_BRACKET | EXCESS(ratio); research
-  admission: EXCESS with ratio >= 1.5 (EXPERIMENTAL).
-- Survival floor (hard) + deterioration overlay (soft, never netted).
-- Replay gates run under FROZEN rules; if the frozen methodology does not
-  produce the expected classification, STOP AND REPORT THE DISCREPANCY —
-  thresholds are never tuned to force a fixture to pass (approved condition 2).
+初始窗口：60 日特征预热、504 日训练、126 日验证、63 日测试。向前滚动时，各测试段不重叠。提前停止只看验证集，最终预测保留全部样本外交易日，包括尚无未来标签的最近日期。
 
-## Lane B (S3) — summary
+模型按窗口保存 LightGBM 文本文件。配置、依赖版本、输入数据哈希、窗口边界及模型哈希一并记录。`uv.lock` 固定完整依赖解析结果。
 
-L0 OBSERVE -> L1 WATCH (issuer primary) -> L2 EARLY_CANDIDATE (independent
-confirmation; official procurement award qualifies; issuer 中标提示 alone does
-not) -> L3 CONFIRMED (binding commercial) -> L4 CONFIRMATION (never a
-discovery precondition). Pre-revenue admissible. Materiality OR-gates
-G1..G5 (see thresholds). L2 enters multi-model research on the scaled track
-(INV-5). Downgrades are evidence-driven resets, not one-level steps.
+## 回测
 
-## Evidence model
+t 日收盘后选股，t+1 日收盘调整组合。模型与动量每 20 个交易日重排，等权策略采用相同调仓日，SPY 作为宽基持有对照。持仓每日按复权价格收益计价，权重随收益漂移。基准不进入模型候选池。
 
-7 categorical dims (authority, independence, directness, specificity,
-bindingness, reproducibility, freshness) used as RULE INPUTS, never summed.
-Contradiction is a blocking STATE {UNCONTESTED, CONTESTED, SUPERSEDED,
-WITHDRAWN}. An issuer filing verifies that management said X — never
-independent confirmation of X (L2 requires independence >= independent third
-party). Retention classes: OFFICIAL_FULL, MEDIA_EXCERPT, LINK_ONLY.
+目标持仓每只不超过 `max_weight`；默认最多 10 只、各 10%。买卖成本按实际变动名义金额分别扣除。求解扣费后的目标金额，再计算持仓权重。实验结束日计入平仓成本。
 
-## Providers
+包含每日净值、总收益、几何年化收益、年化波动、零现金收益假设下的 Sharpe、最大回撤和累计成交名义金额。Rank IC 使用未来 20 日收益，重叠标签仅作描述，不给出独立样本的显著性结论。
 
-| dataset | chain | role |
-|---|---|---|
-| A-share EOD/universe | tushare -> eastmoney (PROVISIONAL) | SCAN |
-| A benchmarks | tushare -> eastmoney klines | SCAN |
-| A announcements | cninfo (szse/sse/bj) -> exchange sites | EVIDENCE |
-| US EOD scan | yfinance (PROVISIONAL, D4) | SCAN |
-| US filings | edgar (SEC_USER_AGENT required, D3) | EVIDENCE |
-| identifiers | cninfo mapping, edgar tickers, nasdaq dirs | REFERENCE |
-| verification | eodhd (Keychain, ~20 calls/day) | VERIFY |
-| discovery | gdelt(http, integrity caveat) + news RSS | DISCOVERY |
-| FX | frankfurter (ECB) | SCAN |
+模拟尚未实现成交容量、整股交易、税费、停牌成交、行业暴露和用户实际账户约束。目标权重上限在调仓时应用，持有期间不每日强制回调。
 
-PROVISIONAL taint propagates as verification debt; publication requires the
-debt cleared by an evidence/verify-grade source.
+## 日常观察
 
-## Runtime & integration (approved condition 3)
+`observe` 只接收最近一个收盘后经过两小时发布缓冲的交易日结果。节假日和提前收盘由交易日历处理。合成数据不会进入真实观察日志。
 
-The system is THIS Python application + CLI. It owns all logic, prompts,
-numbers, and durable state (gitignored data/). Codex Skills and Claude Code
-may invoke the local CLI. ChatGPT/Deep Research integration uses exported
-evidence bundles or a separately approved API/MCP layer — never direct DB
-access. CI runs tests only, never production. Scheduler: launchd (S5).
+候选变化保存在一个 JSON 日志中，原子替换文件并按日期去重。不同股票池和参数各用独立输出目录。第一条记录建立观察基线，不作为买入提示。通知发送尚未接入。
 
-## Modes & cost
+## 新旧切换
 
-C0 manual workqueue -> C1 one Agent runtime -> C2 two or more runtimes/models
-(optional diversity). Independence is established by two frozen blind work
-orders and two distinct fresh Agent contexts; it does not require different
-providers or models. Caps: $100/month, $15/dossier (config, enforced pre-call
-for metered APIs). Dossiers separately disclose Agent-context independence and
-model/provider diversity.
+恢复标签保留旧代码；新提交沿用原仓库历史，不 force-push、不重新初始化仓库。原本地定时任务 `com.cheology.investment-tool.us-sync` 已卸载，其配置改名为 `.plist.disabled`。新程序继续使用 `invest` 命令，旧子命令已删除。
 
-The `codex` runtime is application-invoked through a fresh ephemeral Codex CLI
-session for every role. Its Search Agent may use Web Search without a source
-whitelist and follow newly discovered entities autonomously. Search snippets
-are leads only: every cited page must pass through `invest research fetch`, be
-stored with lineage/timestamps, and then survive claim validation. The two
-analyst orders are both frozen before either output exists; constructive and
-adversarial read the same bundle, their role inputs exclude the other answer,
-and their contracts prohibit cross-reading.
-
-## Slices
-
-S0 foundations -> S1 Lane A A-share vertical -> S2 US joins Lane A (+EODHD
-port; D3, D4, archive mv) -> S3 Lane B -> S4 research protocol (D1) ->
-S5 monitoring/validation soak. Dashboards/VPS deferred. Frozen cards + PIT
-snapshots ship in S1 so the forward-validation clock starts at first
-publication.
-
-## S2a — US information spine (implemented 2026-08-28; corrected design)
-
-Channels (probe-verified): the daily master index is the EVENING completeness
-artifact (it does not exist intraday); getcurrent ATOM is a lossy best-effort
-freshness layer (pagination demonstrably unstable); efts supplies 8-K item
-codes; submissions JSON supplies second-precision acceptance times. Audits
-carry us_completeness = PENDING_EVENING_INDEX | COMPLETE(date).
-
-Identity & limits: live SEC access requires SEC_USER_AGENT (env or Keychain
-'investment-tool-sec-ua'; placeholders refused; never persisted anywhere).
-One process-global token bucket at 4 req/s (burst 8) under SEC's published
-10 req/s. Conditional GETs where honored.
-
-Routing (classification us_v1, queue-safe): 8-K items 4.02/1.03/3.01, NT
-10-K/10-Q, Form 25, and regulatory halt codes -> HARD_NEGATIVE events;
-content-dependent 8-K items, SC 13D, news-pending halts -> review events
-(aging to ARCHIVED_UNREVIEWED per config v0.2 operational keys); 6-K and
-periodic reports -> observations; Forms 3/4/5, 13G, DEF 14A, registrations ->
-reference. Detection is separated from interpretation; no sign is inferred
-without content except the adverse-on-face set.
-
-Evidence: independence derived from filing-party role (ISSUER 0, INSIDER 1,
-third-party FILER about SUBJECT 2, exchange/regulator 3; unresolved roles
-floor at 0 with PARTY_ROLES_UNRESOLVED noted). A halt verifies only that the
-halt occurred. Amendments link only on unique (cik, base form, report_period)
-(LINKED_UNIQUE -> original AMENDED_BY + evidence SUPERSEDED; else AMBIGUOUS/
-UNLINKED). Removals are two-step: index absence -> REMOVAL_SUSPECTED; only a
-confirmed 404/410 direct fetch -> REMOVED + evidence WITHDRAWN.
-
-cik_map is temporally versioned (validity intervals; PIT resolution; history
-never rewritten); reconciliation against the Nasdaq-file universe uses
-explicit states and refuses conflicted mappings before lookup. Lookahead
-protection keys on first_seen_at_utc end-to-end.
-
-Live gate (PR-7, pending): real SEC_USER_AGENT from the user; then us-map
-live sync, daily us-sync (evening ET), halts polling, weekly full-index
-reconciliation, and a 5-calendar-day soak covering >=3 filing days including
-one amendment case and a crash-recovery drill.
-
-## US opportunity trial (2026-08-28) — status: historical experimental record
-
-The first US trial run (asof 2026-08-28, events of 2026-08-26/27) is
-preserved as an EXPERIMENTAL record, not a validated result. Adjudicated
-corrections (approved review):
-- outputs are LEADS (price trigger + keyword routing), never opportunities;
-  the run's 23 admissions were relabeled US_TRIAL_LEAD and reissued as v2
-  cards (v1 frozen cards retained, SUPERSEDED);
-- budget exhaustion is US_TRIAL_RESEARCH_PENDING, never INSUFFICIENT_DATA
-  (35 rows relabeled; audit us_trial_2026-08-28_correction.json);
-- cards assert no bounded/temporary-damage conclusions; trailing asof
-  windows are labeled non-event-anchored diagnostics;
-- HQY is UNRESOLVED pending sourced evidence.
-Known engine defects (trailing windows as gates, no episode consolidation)
-are fixed by the PR-A/PR-B slices; the next real run is gated on those plus
-the PR-G soak.
+本地历史数据保持忽略，新实现不迁移、不读取。GitHub 只保存新代码、配置、测试、文档和依赖锁文件。
