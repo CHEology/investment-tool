@@ -22,10 +22,11 @@ def test_completed_market_sessions(now, expected):
     assert expected_session(pd.Timestamp(now)) == expected
 
 
-def fixture_run(tmp_path, synthetic=False, date="2024-01-08"):
+def fixture_run(tmp_path, synthetic=False, date="2024-01-08", candidates=None):
     run = tmp_path / "run"
     run.mkdir()
-    write_json(run / "ranking.json", {"as_of": date, "candidates": [{"symbol": "AAA"}]})
+    candidates = candidates or [{"symbol": "AAA"}]
+    write_json(run / "ranking.json", {"as_of": date, "candidates": candidates})
     write_json(run / "evaluation.json", {})
     write_json(
         run / "manifest.json",
@@ -60,3 +61,14 @@ def test_stale_and_synthetic_observations_block(tmp_path):
     write_json(run / "manifest.json", manifest)
     with pytest.raises(DataError, match="non-synthetic"):
         observe(run, tmp_path)
+
+
+def test_tied_cutoff_names_all_enter_the_journal(tmp_path):
+    candidates = [
+        {"symbol": "AAA", "selected": True},
+        {"symbol": "BBB", "selected": True},
+        {"symbol": "CCC", "selected": False},
+    ]
+    run = fixture_run(tmp_path, candidates=candidates)
+    path = observe(run, tmp_path, pd.Timestamp("2024-01-08T23:01:00Z"))
+    assert json.loads(path.read_text())["observations"][0]["top"] == ["AAA", "BBB"]

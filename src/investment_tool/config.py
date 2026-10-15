@@ -1,3 +1,4 @@
+import math
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -16,6 +17,9 @@ class ResearchConfig:
     benchmark: str = "SPY"
     seed: int = 42
     num_boost_round: int = 200
+    # top_k may be at most this share of the candidate universe; otherwise the
+    # "model" portfolio is nearly the equal-weight universe and tests nothing.
+    max_selection_fraction: float = 0.3
 
     def __post_init__(self):
         for name in (
@@ -33,8 +37,14 @@ class ResearchConfig:
             raise ValueError("Alpha158 needs at least 60 warmup sessions")
         if not 0 < self.max_weight <= 1 or not 0 <= self.cost_bps < 1000:
             raise ValueError("Invalid concentration cap or transaction cost")
+        if not 0 < self.max_selection_fraction <= 1:
+            raise ValueError("max_selection_fraction must be in (0, 1]")
         if self.top_k * self.max_weight > 1.0000001:
             raise ValueError("top_k * max_weight must not exceed 1")
+
+    def min_universe(self) -> int:
+        """Smallest candidate universe for which top_k is a real selection."""
+        return math.ceil(self.top_k / self.max_selection_fraction - 1e-9)
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -73,7 +73,12 @@ def observe(run: Path, root: Path, now: pd.Timestamp | None = None) -> Path:
             if date == previous["as_of"]:
                 return journal_path
             raise DataError("Cannot move the paper journal backwards")
-        top = [c["symbol"] for c in ranking["candidates"][: manifest["config"]["top_k"]]]
+        candidates = ranking["candidates"]
+        if all("selected" in c for c in candidates):
+            # Tied cutoff scores can select more than top_k names.
+            top = [c["symbol"] for c in candidates if c["selected"]]
+        else:
+            top = [c["symbol"] for c in candidates[: manifest["config"]["top_k"]]]
         old_top = previous["top"] if previous else []
         observations.append(
             {

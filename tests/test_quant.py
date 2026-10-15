@@ -59,8 +59,8 @@ def test_end_to_end_real_engines(tmp_path):
         train_sessions=252,
         valid_sessions=63,
         test_sessions=200,
-        top_k=5,
-        max_weight=0.2,
+        top_k=4,
+        max_weight=0.25,
         num_boost_round=5,
     )
     run = research(snapshot, tmp_path, config)
@@ -72,3 +72,17 @@ def test_end_to_end_real_engines(tmp_path):
     assert "SPY" not in {c["symbol"] for c in ranking["candidates"]}
     scores = pd.read_csv(run / "scores.csv", index_col=0)
     assert np.isfinite(scores).all().all()
+    evaluated = json.loads((run / "evaluation.json").read_text())
+    assert set(evaluated["strategies"]) >= {"momentum", "momentum_12_1", "equal_weight"}
+    assert set(evaluated["relative_to_equal_weight"]) == {"model", "momentum", "momentum_12_1"}
+    assert evaluated["rank_ic_non_overlapping"]["step_sessions"] == 20
+    assert evaluated["rank_ic_by_year"]
+    diagnostics = evaluated["fold_diagnostics"]
+    assert diagnostics["did_not_learn"] == sum(f["did_not_learn"] for f in evaluated["folds"])
+    for fold in evaluated["folds"]:
+        assert fold["did_not_learn"] == (fold["best_iteration"] <= 5)
+        assert 0 < fold["mean_unique_score_ratio"] <= 1 and "rank_ic" in fold
+    selected = [c for c in ranking["candidates"] if c["selected"]]
+    assert sum(c["target_weight"] for c in selected) == pytest.approx(1.0)
+    report = (run / "report.html").read_text()
+    assert "相对等权股票池" in report and "12-1 月动量" in report and "训练窗口" in report

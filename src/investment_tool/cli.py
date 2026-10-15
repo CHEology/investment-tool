@@ -62,8 +62,8 @@ def main(argv=None) -> int:
                 config = ResearchConfig(
                     train_sessions=252,
                     valid_sessions=63,
-                    top_k=5,
-                    max_weight=0.2,
+                    top_k=4,
+                    max_weight=0.25,
                     num_boost_round=40,
                 )
             else:

@@ -9,6 +9,10 @@ import pandas as pd
 from .config import ResearchConfig
 from .data import DataError
 
+# A fold whose validation loss stops improving within this many trees has learned
+# essentially nothing: scores collapse to a handful of leaf values per day.
+MIN_LEARNED_ITERATIONS = 5
+
 
 @dataclass(frozen=True)
 class Fold:
@@ -115,9 +119,11 @@ def train_predict(
         raise DataError("Empty train, validation or prediction segment")
 
     # Cross-sectional target rank is not a percent return forecast.
+    def target(rows):
+        return rows["label"]["LABEL0"].groupby(level="datetime").rank(pct=True) - 0.5
+
     def dataset(rows):
-        label = rows["label"]["LABEL0"].groupby(level="datetime").rank(pct=True) - 0.5
-        return lgb.Dataset(rows["feature"], label=label)
+        return lgb.Dataset(rows["feature"], label=target(rows))
 
     model = lgb.train(
         {
@@ -142,4 +148,22 @@ def train_predict(
     scores = pd.Series(model.predict(test["feature"]), index=test.index, name="score")
     if not np.isfinite(scores).all():
         raise DataError("Non-finite model output")
-    return scores, model.best_iteration
+    return scores, diagnostics(model, train, valid, test, scores, target)
+
+
+def diagnostics(model, train, valid, test, scores: pd.Series, target) -> dict:
+    """Evidence on whether a fold learned anything beyond a constant forecast."""
+    valid_target = target(valid)
+    constant = float(((valid_target - target(train).mean()) ** 2).mean())
+    by_day = scores.groupby(level="datetime")
+    best_iteration = int(model.best_iteration)
+    return {
+        "best_iteration": best_iteration,
+        "did_not_learn": best_iteration <= MIN_LEARNED_ITERATIONS,
+        "train_rows": len(train),
+        "valid_rows": len(valid),
+        "test_rows": len(test),
+        "valid_l2": float(model.best_score["valid_0"]["l2"]),
+        "valid_l2_constant": constant,
+        "mean_unique_score_ratio": float((by_day.nunique() / by_day.size()).mean()),
+    }

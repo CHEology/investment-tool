@@ -6,6 +6,27 @@ import pandas as pd
 from .config import ResearchConfig
 from .data import DataError
 
+MODES = ("model", "equal_weight", "momentum", "momentum_12_1", "benchmark")
+
+
+def select_weights(signal: pd.Series, top_k: int, max_weight: float) -> pd.Series:
+    """Target weights for the top_k highest signals, independent of symbol order.
+
+    Tie rule: names strictly above the cutoff score get max_weight each. All names
+    whose score equals the cutoff (the top_k-th highest) share the remaining
+    (top_k - n_above) * max_weight equally, so total exposure and the per-name cap
+    are unchanged and no name wins a tie by its ticker. Equality is exact.
+    """
+    if top_k > len(signal):
+        raise DataError("Not enough candidates for top_k")
+    cutoff = signal.nlargest(top_k, keep="all").min()
+    above = signal > cutoff
+    tied = signal == cutoff
+    weights = pd.Series(0.0, index=signal.index)
+    weights[above] = max_weight
+    weights[tied] = (top_k - int(above.sum())) * max_weight / int(tied.sum())
+    return weights
+
 
 def simulate(
     prices: pd.DataFrame,
@@ -20,7 +41,7 @@ def simulate(
     Weights drift with returns. Fees apply to absolute buy+sell notional. Shares
     may be fractional; cash earns zero. Final NAV includes liquidation fees.
     """
-    if mode not in {"model", "equal_weight", "momentum", "benchmark"}:
+    if mode not in MODES:
         raise ValueError("Unknown strategy")
     cost = (config.cost_bps if cost_bps is None else cost_bps) / 10000
     if not 0 <= cost < 0.1:
@@ -44,7 +65,11 @@ def simulate(
     if not scores.index.equals(dates[first : final + 1]):
         raise DataError("Score panel is not contiguous")
     returns = prices.pct_change(fill_method=None)
-    momentum = prices / prices.shift(60) - 1
+    momentum = {
+        "momentum": prices / prices.shift(60) - 1,
+        # 12-1: trailing 252-session return, skipping the most recent 21 sessions.
+        "momentum_12_1": prices.shift(21) / prices.shift(252) - 1,
+    }
     weights = pd.Series(0.0, index=prices.columns)
     nav = 1.0
     pending = None
@@ -83,11 +108,12 @@ def simulate(
             elif mode == "equal_weight":
                 target.loc[scores.columns] = min(1 / len(scores.columns), config.max_weight)
             else:
-                signal = scores.loc[day] if mode == "model" else momentum.loc[day, scores.columns]
+                signal = (
+                    scores.loc[day] if mode == "model" else momentum[mode].loc[day, scores.columns]
+                )
                 if not np.isfinite(signal).all():
                     raise DataError("Missing ranking signal")
-                selected = signal.sort_index().sort_values(ascending=False, kind="stable")
-                target.loc[selected.index[: config.top_k]] = config.max_weight
+                target.loc[signal.index] = select_weights(signal, config.top_k, config.max_weight)
             pending = target
         records.append(
             {
