@@ -27,6 +27,12 @@ def main(argv=None) -> int:
     run.add_argument("--config", type=Path)
     observe = sub.add_parser("observe", help="Record today's research shortlist locally")
     observe.add_argument("run", type=Path)
+    daily = sub.add_parser("daily", help="Prepare one completed session for Codex research")
+    daily.add_argument("--config", type=Path, default=Path("config/us-daily.toml"))
+    daily.add_argument("--snapshot", type=Path)
+    daily.add_argument("--holdings", default="", help="Additional US symbols from broker holdings")
+    brief = sub.add_parser("brief", help="Render a researched daily report")
+    brief.add_argument("day", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "fetch":
@@ -50,6 +56,19 @@ def main(argv=None) -> int:
                 )
             )
             return 0
+        elif args.command == "daily":
+            from .daily import prepare_daily
+
+            path = prepare_daily(
+                args.root,
+                args.config,
+                args.snapshot,
+                [s.strip().upper() for s in args.holdings.split(",") if s.strip()],
+            )
+        elif args.command == "brief":
+            from .brief import render_brief
+
+            path = render_brief(args.day)
         elif args.command == "observe":
             from .watch import observe
 

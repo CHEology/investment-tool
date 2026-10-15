@@ -1,0 +1,25 @@
+[daily]
+start = "2020-01-01"
+retrain_sessions = 21
+symbols = [
+  "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "AMD",
+  "ORCL", "CRM", "ADBE", "CSCO", "JPM", "BAC", "GS", "MS", "V", "MA",
+  "UNH", "JNJ", "ABBV", "MRK", "LLY", "TMO", "ABT", "XOM", "CVX", "COP",
+  "PG", "KO", "PEP", "WMT", "COST", "HD", "MCD", "CAT", "DE", "HON",
+  "NEE", "DUK", "SO", "AMT", "PLD", "NFLX", "DIS", "CMCSA", "UPS", "LMT"
+]
+market_symbols = ["SPY", "QQQ", "IWM", "TLT"]
+
+[research]
+horizon = 20
+train_sessions = 504
+valid_sessions = 126
+test_sessions = 63
+warmup_sessions = 60
+top_k = 10
+max_weight = 0.10
+cost_bps = 15.0
+benchmark = "SPY"
+seed = 42
+num_boost_round = 200
+max_selection_fraction = 0.3

@@ -4,6 +4,26 @@
 
 旧实现已整体替换，Git 历史完整保留。恢复点：`archive/pre-qlib-rebuild-20261014`。
 
+## 每日投资研究
+
+日常入口使用 48 只跨行业美股作为固定研究样本，并跟踪 SPY、QQQ、IWM、TLT。Codex 从已连接 IBKR 读取真实持仓，将其代码作为额外行情输入：
+
+```sh
+uv run --no-sync invest --root artifacts/daily-system daily --holdings <持仓代码，逗号分隔>
+```
+
+程序输出当天的 `packet.json`：收盘表现、样本广度、Qlib 排名、候选变化和模型诊断。模型通常每 21 个交易日重训，日常复用；同一交易日重复执行会返回已有记录。
+
+Codex 按 [日报运行说明](docs/DAILY_RUNBOOK.md) 读取持仓、核对官方财报与事件、保存证据并写 `analysis.json`，再完成报告：
+
+```sh
+uv run --no-sync invest brief artifacts/daily-system/days/<交易日>
+```
+
+结果是包含组合复核、市场变化、候选支持与反证、事件日历和行动条件的 `report.html`。`follow-up.json` 保存待验证判断，下一次日报继续复核。`awaiting_research` 表示只完成量化计算，`completed` 才表示日报完成。
+
+定时运行由 Codex 当前聊天唤醒并执行完整流程；不需要另一个模型 API 或常驻服务。账户资料与日报仅保存在被 Git 忽略的 `artifacts/` 中。量化排序用于研究优先级，实际效度由验证结果决定。
+
 ## 开始使用
 
 Python 3.12；macOS 先安装 LightGBM 的 OpenMP 依赖：
